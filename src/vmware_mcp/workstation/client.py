@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Literal
 
-from ..config import WorkstationSettings
+from ..config import Settings
 from ..errors import InvalidArgumentError
 from .discovery import DiscoveredVm, VmInventory, name_matches
 from .guest import GuestAuth, GuestOps
@@ -35,7 +35,7 @@ class WorkstationClient:
 
     def __init__(
         self,
-        settings: WorkstationSettings,
+        settings: Settings,
         runner: VmrunRunner | None = None,
         inventory: VmInventory | None = None,
     ) -> None:

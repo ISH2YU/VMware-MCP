@@ -1,60 +1,25 @@
 # VMware MCP
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI assistant drive
-**VMware Workstation, Fusion or Player on your own machine** — list VMs, power them on and off,
-take snapshots, clone a golden Windows image into a pile of disposable test VMs, copy installers
-in, run commands inside the guest, and tear everything down again.
+A [Model Context Protocol](https://modelcontextprotocol.io) server for **VMware Workstation**
+(also works with Fusion and Player on the same machine).
 
-It talks to the local hypervisor through VMware's `vmrun` command-line tool. No vCenter, no
-appliance, nothing to install on the guests beyond VMware Tools (which you want anyway).
+It lets an AI assistant manage the VMs on your PC: list them, power them on/off, take snapshots,
+clone a golden Windows image into many disposable test VMs, copy installers in, run commands
+inside the guest, and tear them down when you are done.
 
-There is also an optional **vSphere** backend for vCenter Server / ESXi if you need it later; the
-default is local.
+It uses VMware's built-in `vmrun` tool. No vCenter. No ESXi. No extra agents.
 
-> **Read-only by default.** Out of the box the server refuses every operation that would change a
-> VM. Enabling writes (cloning, power, guest commands) is a deliberate step.
+> **Read-only by default.** Nothing that changes a VM works until you set
+> `VMWARE_PERMISSION_MODE=write`.
 
-## Why this exists
+## What you need
 
-The workflow it is built for:
+1. **VMware Workstation** installed (Fusion or Player also fine)
+2. **Python 3.10+**
+3. For running commands inside Windows VMs: **VMware Tools** in the guest, plus a guest
+   username/password
 
-1. Keep one golden Windows VM (say `win11-golden`) with VMware Tools, updates and a clean
-   `golden` snapshot.
-2. Ask the AI to spin up N linked clones from that snapshot for a test run.
-3. Have it wait until Tools is up, copy an installer in, run a silent install, capture the result
-   (and a screenshot if it fails).
-4. Revert or delete the clones when you are done.
-
-That is what `vmware_clone_many`, `vmware_wait_for_guest`, `vmware_copy_to_guest`,
-`vmware_run_command` and `vmware_revert_snapshot` are for.
-
-## Contents
-
-- [Requirements](#requirements)
-- [Quick start](#quick-start)
-- [Configure an MCP client](#configure-an-mcp-client)
-- [Permission modes](#permission-modes)
-- [Typical workflows](#typical-workflows)
-- [Tools](#tools)
-- [Resources and prompts](#resources-and-prompts)
-- [Configuration reference](#configuration-reference)
-- [Referring to VMs](#referring-to-vms)
-- [Security notes](#security-notes)
-- [Optional: vSphere backend](#optional-vsphere-backend)
-- [Development](#development)
-
-## Requirements
-
-- **VMware Workstation Pro**, **VMware Fusion** or **VMware Player/Workstation Player** installed
-  locally, with the `vmrun` tool available (it ships with all of them).
-- **Python 3.10+**
-- For guest commands (run installer, copy files, etc.): **VMware Tools** inside the guest, plus a
-  guest username/password the server can use.
-
-`vmrun` is usually on `PATH`. If not, set `VMWARE_VMRUN_PATH` (see below for the usual install
-locations).
-
-## Quick start
+## Install
 
 ```bash
 git clone https://github.com/ISH2YU/VMware-MCP.git
@@ -62,59 +27,51 @@ cd VMware-MCP
 pip install -e .
 ```
 
-Point it at the folder where your VMs live and check that it can see them:
+## Configure
 
-```bash
-# Windows example
-set VMWARE_VM_DIRS=%USERPROFILE%\Documents\Virtual Machines
-set VMWARE_PERMISSION_MODE=write
-set VMWARE_GUEST_USERNAME=Administrator
-set VMWARE_GUEST_PASSWORD=...
+Set these (PowerShell example — adjust the path to where your VMs live):
 
-vmware-mcp --check
+```powershell
+$env:VMWARE_VM_DIRS = "$env:USERPROFILE\Documents\Virtual Machines"
+$env:VMWARE_PERMISSION_MODE = "write"
+$env:VMWARE_GUEST_USERNAME = "Administrator"
+$env:VMWARE_GUEST_PASSWORD = "YourGuestPassword"
 ```
 
+macOS / Linux:
+
 ```bash
-# macOS / Linux example
-export VMWARE_VM_DIRS="$HOME/Virtual Machines.localized"   # Fusion default; adjust for Workstation
+export VMWARE_VM_DIRS="$HOME/vmware"          # or ~/Virtual Machines.localized on Fusion
 export VMWARE_PERMISSION_MODE=write
 export VMWARE_GUEST_USERNAME=Administrator
 export VMWARE_GUEST_PASSWORD='...'
+```
 
+Check that it can see your VMs:
+
+```bash
 vmware-mcp --check
 ```
 
-`--check` finds `vmrun`, scans your VM directories and prints a summary:
+You should get JSON like:
 
 ```json
 {
   "backend": "workstation",
   "product": "ws",
   "vmrun": "C:\\Program Files (x86)\\VMware\\VMware Workstation\\vmrun.exe",
-  "vmrun_version": "vmrun version 1.17.0 build-...",
-  "vm_directories": ["C:\\Users\\you\\Documents\\Virtual Machines"],
-  "vm_count": 4,
-  "running_count": 1,
-  "guest_credentials_configured": true,
-  "connection": {
-    "backend": "workstation",
-    "permission_mode": "write",
-    "product": "ws"
-  }
+  "vm_count": 3,
+  "running_count": 0,
+  "guest_credentials_configured": true
 }
 ```
 
-Then run the server (stdio is what desktop MCP clients expect):
+If it says it cannot find `vmrun`, set `VMWARE_VMRUN_PATH` to the full path of `vmrun.exe`
+(usually under `C:\Program Files (x86)\VMware\VMware Workstation\`).
 
-```bash
-vmware-mcp
-```
+## Add it to Cursor
 
-## Configure an MCP client
-
-### Cursor
-
-Add to `~/.cursor/mcp.json` (or `.cursor/mcp.json` in a project):
+In `~/.cursor/mcp.json` (or `.cursor/mcp.json` in a project):
 
 ```json
 {
@@ -122,268 +79,121 @@ Add to `~/.cursor/mcp.json` (or `.cursor/mcp.json` in a project):
     "vmware": {
       "command": "vmware-mcp",
       "env": {
-        "VMWARE_VM_DIRS": "C:\\Users\\you\\Documents\\Virtual Machines",
+        "VMWARE_VM_DIRS": "C:\\Users\\YOU\\Documents\\Virtual Machines",
         "VMWARE_PERMISSION_MODE": "write",
         "VMWARE_GUEST_USERNAME": "Administrator",
-        "VMWARE_GUEST_PASSWORD": "..."
+        "VMWARE_GUEST_PASSWORD": "YourGuestPassword"
       }
     }
   }
 }
 ```
 
-On a Mac with Fusion, set `"VMWARE_PRODUCT": "fusion"` and point `VMWARE_VM_DIRS` at
-`~/Virtual Machines.localized`.
+Restart Cursor. You should see the `vmware_*` tools available to the agent.
 
-### Claude Desktop
+## How to use it for Windows test VMs
 
-Same shape in `claude_desktop_config.json`.
+### 1. Prepare a golden image (once)
 
-### Over HTTP
+In Workstation, create a Windows VM, install VMware Tools, Windows updates, and anything else
+you always want. Take a snapshot named `golden`. Keep this VM powered off when cloning from it.
 
-```bash
-vmware-mcp --transport streamable-http --host 127.0.0.1 --port 8000
-```
+### 2. Ask the AI to spin up test VMs
 
-Bind to localhost (or put it behind an authenticating proxy). The HTTP endpoint has no auth of its
-own.
+Example prompts:
 
-## Permission modes
+> Clone 5 linked VMs from `win11-golden` using snapshot `golden`, name them `web-test-01` through
+> `web-test-05`, start them headless, wait until each has an IP, and list the IPs.
 
-`VMWARE_PERMISSION_MODE` decides how much the server can do. Modes are cumulative.
-
-| Mode | What it allows |
-| --- | --- |
-| `read-only` (default) | List and inspect VMs, list snapshots, wait for guest/Tools. Everything that changes a VM refuses. |
-| `write` | Adds power on/off, create snapshots, clone (including batch), reconfigure, screenshots, and all guest operations (run command, copy files). |
-| `destructive` | Adds deleting VMs and reverting or deleting snapshots. |
-
-Deleting a VM additionally requires `confirm=true` and refuses while the VM is powered on.
-
-For the "spin up Windows test VMs" workflow you want at least `write`. Use `destructive` when you
-also want the AI to revert or delete clones when a run finishes.
-
-## Typical workflows
-
-### Spin up N Windows test VMs from a golden image
-
-Keep a template VM with a clean snapshot named `golden`. Then ask the assistant something like:
-
-> Clone 5 linked VMs from `win11-golden` snapshot `golden`, name them `web-test-01` …
-> `web-test-05`, start them headless, wait until each has Tools and an IP, and list the IPs.
-
-Under the hood that is:
-
-1. `vmware_get_vm` / `vmware_list_snapshots` on the golden image
-2. `vmware_clone_many` with `clone_type=linked`, `snapshot=golden`, `start=true`
-3. `vmware_wait_for_guest` per clone
-4. Report names, paths and IPs
-
-There is a built-in prompt for this: `spin_up_test_vms`.
-
-### Install and test a package on one Windows VM
-
-> On `web-test-01`, copy `C:\Builds\app.msi` to `C:\Temp\app.msi`, install it quietly, and tell me
-> if it worked.
-
-1. `vmware_wait_for_guest`
-2. `vmware_run_command` to ensure `C:\Temp` exists
-3. `vmware_copy_to_guest`
-4. `vmware_run_command` with `msiexec.exe /i C:\Temp\app.msi /qn`
-5. `vmware_screenshot` if the exit code is non-zero
-
-Built-in prompt: `run_windows_test`.
-
-### Reset everything between runs
+> On `web-test-01`, copy `C:\Builds\app.msi` to `C:\Temp\app.msi`, install it quietly with msiexec,
+> and tell me the exit code. Screenshot if it fails.
 
 > Revert every VM named `web-test-*` back to snapshot `golden`.
 
-Built-in prompt: `reset_test_vms`. Or delete them with `vmware_delete_vm` (needs `destructive` +
-`confirm=true`).
+There are also built-in prompts: `spin_up_test_vms`, `run_windows_test`, `reset_test_vms`.
 
-## Tools
+### 3. What the tools do
 
-All local tools are prefixed `vmware_`.
-
-### Inventory
-
-| Tool | Purpose |
+| Tool | What it does |
 | --- | --- |
-| `vmware_about` | Product, `vmrun` path, VM counts, guest-credential status, permission mode. Call this first. |
-| `vmware_list_vms` | List VMs under the configured directories. Filter by name, guest OS, family, running/off. |
-| `vmware_get_vm` | One VM in full: CPU, memory, disks, NICs, Tools state, IP, snapshots. |
-| `vmware_list_running` | `.vmx` paths of every VM currently powered on. |
+| `vmware_about` | Product, vmrun path, how many VMs it sees, permission mode |
+| `vmware_list_vms` | List VMs (filter by name, Windows/Linux, running/off) |
+| `vmware_get_vm` | Full detail: CPU, RAM, disks, Tools, IP, snapshots |
+| `vmware_list_running` | Which VMs are powered on right now |
+| `vmware_power_vm` | start / stop / reset / suspend / pause (soft or hard) |
+| `vmware_list_snapshots` | Snapshot names |
+| `vmware_create_snapshot` | Take a snapshot (e.g. `golden`) |
+| `vmware_revert_snapshot` | Roll a VM back |
+| `vmware_delete_snapshot` | Delete a snapshot |
+| `vmware_clone_vm` | Clone one VM (`linked` recommended) |
+| `vmware_clone_many` | Clone N VMs as `prefix-01` … `prefix-N` — the main test-lab tool |
+| `vmware_reconfigure_vm` | Change name / CPU / RAM (VM must be off) |
+| `vmware_delete_vm` | Delete a VM (`confirm=true` required) |
+| `vmware_screenshot` | PNG of the VM display |
+| `vmware_wait_for_guest` | Wait until Tools is up (and optionally an IP) |
+| `vmware_run_command` | Run a program in the guest; returns exit code + stdout/stderr |
+| `vmware_run_script` | Upload and run a short script (PowerShell/cmd/bash) |
+| `vmware_copy_to_guest` | Copy a file from your PC into the VM |
+| `vmware_copy_from_guest` | Copy a file out of the VM |
+| `vmware_list_guest_directory` | List a folder inside the guest |
 
-### Power
+**Permission modes**
 
-| Tool | Mode | Purpose |
-| --- | --- | --- |
-| `vmware_power_vm` | `write` | `start`, `stop`, `reset`, `suspend`, `pause`, `unpause`, `hard_stop`, `hard_reset`. Soft stop/reset ask the guest via Tools; hard_* pull the plug. `gui=false` (default) starts headless. |
-
-### Snapshots
-
-| Tool | Mode | Purpose |
-| --- | --- | --- |
-| `vmware_list_snapshots` | read | Snapshot names on a VM. |
-| `vmware_create_snapshot` | `write` | Take a snapshot (e.g. `golden` on the template). |
-| `vmware_revert_snapshot` | `destructive` | Roll a VM back, discarding later changes. |
-| `vmware_delete_snapshot` | `destructive` | Delete a snapshot, optionally with children. |
-
-### Clone / reconfigure / delete
-
-| Tool | Mode | Purpose |
-| --- | --- | --- |
-| `vmware_clone_vm` | `write` | Clone one VM. Prefer `clone_type=linked` + `snapshot=...` for test labs. |
-| `vmware_clone_many` | `write` | Clone N VMs as `{prefix}-01` … `{prefix}-N` (max 50). Continues past individual failures. |
-| `vmware_reconfigure_vm` | `write` | Change display name, CPU, memory or notes. VM must be powered off; edits the `.vmx`. |
-| `vmware_delete_vm` | `destructive` | Delete a VM and its files. Needs `confirm=true`. |
-| `vmware_screenshot` | `write` | Capture a PNG of a running VM's display. |
-
-### Guest operations (need Tools + credentials)
-
-| Tool | Mode | Purpose |
-| --- | --- | --- |
-| `vmware_wait_for_guest` | read | Block until Tools is running, optionally until an IP is assigned. |
-| `vmware_run_command` | `write` | Run a program in the guest; returns exit code, stdout and stderr. |
-| `vmware_run_script` | `write` | Upload a short script and run it (handy for multi-line PowerShell). |
-| `vmware_copy_to_guest` | `write` | Copy a host file into the guest. |
-| `vmware_copy_from_guest` | `write` | Copy a guest file out to the host. |
-| `vmware_list_guest_directory` | read | List a directory inside the guest. |
-
-Guest credentials come from `VMWARE_GUEST_USERNAME` / `VMWARE_GUEST_PASSWORD`, or can be passed per
-call. On Windows, `program` is usually `cmd.exe` or `powershell.exe`.
-
-## Resources and prompts
-
-Resources:
-
-- `vmware://vms` — every discovered local VM
-- `vmware://vm/{identifier}` — full detail for one VM
-
-Prompts:
-
-- `spin_up_test_vms(template, count, name_prefix, snapshot)` — clone N disposable VMs from a golden image
-- `run_windows_test(vm, installer_host_path, guest_path)` — copy, install, report
-- `reset_test_vms(name_prefix, snapshot)` — revert a batch back to clean
-
-## Configuration reference
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `VMWARE_BACKEND` | auto | `workstation` (default) or `vsphere`. Auto: vSphere if `VMWARE_HOST` is set, else local. |
-| `VMWARE_VM_DIRS` | platform default | Directories to scan for `.vmx` files. Use the OS path separator to list several. |
-| `VMWARE_VMRUN_PATH` | auto-detect | Full path to `vmrun` if it is not on `PATH`. |
-| `VMWARE_PRODUCT` | auto | `ws` (Workstation), `fusion`, or `player`. Auto: `fusion` on macOS, `ws` elsewhere. |
-| `VMWARE_GUEST_USERNAME` | — | Default guest OS username for guest operations. |
-| `VMWARE_GUEST_PASSWORD` | — | Default guest OS password. |
-| `VMWARE_PERMISSION_MODE` | `read-only` | `read-only`, `write` or `destructive`. |
-| `VMWARE_COMMAND_TIMEOUT` | `120` | Seconds before a `vmrun` call is killed. Raise this for big full clones. |
-| `VMWARE_GUEST_TIMEOUT` | `300` | Seconds for guest program runs and file copies. |
-| `VMWARE_BOOT_TIMEOUT` | `300` | Seconds to wait for Tools / guest IP after power on. |
-| `VMWARE_MAX_OUTPUT_BYTES` | `100000` | Cap on captured guest stdout/stderr. |
-| `VMWARE_MAX_RESULTS` | `500` | Hard cap on items returned by any listing. |
-| `VMWARE_DEFAULT_PAGE_SIZE` | `100` | Page size when a tool call omits `limit`. |
-| `VMWARE_LOG_LEVEL` | `INFO` | Logs go to stderr (stdout is the MCP protocol). |
-| `VMWARE_TRANSPORT` | `stdio` | `stdio`, `streamable-http` or `sse`. |
-
-### Where `vmrun` usually lives
-
-| Platform | Typical path |
+| Mode | Allows |
 | --- | --- |
-| Windows | `C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe` |
-| macOS | `/Applications/VMware Fusion.app/Contents/Public/vmrun` |
-| Linux | `/usr/bin/vmrun` |
+| `read-only` (default) | List and inspect only |
+| `write` | Power, create snapshots, clone, reconfigure, guest commands, screenshots |
+| `destructive` | Also revert/delete snapshots and delete VMs |
 
-### Where VMs usually live
-
-| Platform | Typical folder |
-| --- | --- |
-| Windows | `%USERPROFILE%\Documents\Virtual Machines` |
-| macOS (Fusion) | `~/Virtual Machines.localized` |
-| Linux | `~/vmware` |
-
-Command-line flags: `--backend`, `--vmrun`, `--product`, `--vm-dir` (repeatable), `--guest-user`,
-`--permission-mode`, `--transport`, `--host`, `--port`, `--log-level`, `--check`. Run
-`vmware-mcp --help` for details. There is deliberately no password flag — passwords on a command
-line end up in the process list and shell history.
+For day-to-day test labs use `write`. Switch to `destructive` when you want the AI to clean up.
 
 ## Referring to VMs
 
-Every tool that takes a VM accepts any of:
+Any of these work as the `vm` argument:
 
-- the display name — `win11-golden` (case-insensitive)
-- a glob, where a name filter is accepted — `web-test-*`
-- the full `.vmx` path
-- the directory / stem name
-- the BIOS UUID from the `.vmx`
+- Display name: `win11-golden`
+- Full `.vmx` path
+- Folder / stem name
+- BIOS UUID from the `.vmx`
 
-When several VMs match, the tool lists the candidates with their paths rather than picking one.
+If two VMs share a name, the tool lists both paths instead of guessing.
 
-## Security notes
+## Configuration reference
 
-- **Start in `read-only`.** Only raise the permission mode when you actually want the AI to change
-  VMs. Prompt injection (through a VM annotation, a web page the model reads, etc.) is a real risk.
-- **Guest credentials are powerful.** The account in `VMWARE_GUEST_USERNAME` can run arbitrary
-  commands inside every VM the server can see. Use a dedicated local admin on the golden image, not
-  your day-to-day account, and prefer `write` over `destructive` until you need revert/delete.
-- **Passwords never appear in tool output.** `vmware_about` reports whether guest credentials are
-  configured, not what they are.
-- **Linked clones share disks with the parent.** Do not delete or heavily modify the golden image
-  while linked clones still depend on it.
-- **Secrets in MCP client config files** are stored in plain text by most clients. Prefer a secret
-  manager or environment variables where your client supports them.
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `VMWARE_VM_DIRS` | platform default | Folders to scan for `.vmx` files |
+| `VMWARE_VMRUN_PATH` | auto | Full path to `vmrun` if not on PATH |
+| `VMWARE_PRODUCT` | `ws` (Fusion on Mac) | `ws`, `fusion`, or `player` |
+| `VMWARE_GUEST_USERNAME` | — | Guest OS user for run/copy tools |
+| `VMWARE_GUEST_PASSWORD` | — | Guest OS password |
+| `VMWARE_PERMISSION_MODE` | `read-only` | `read-only` / `write` / `destructive` |
+| `VMWARE_COMMAND_TIMEOUT` | `120` | Seconds before a `vmrun` call is killed |
+| `VMWARE_GUEST_TIMEOUT` | `300` | Timeout for guest programs / file copies |
+| `VMWARE_BOOT_TIMEOUT` | `300` | How long to wait for Tools / IP after power on |
+| `VMWARE_LOG_LEVEL` | `INFO` | Logs go to stderr |
 
-## Optional: vSphere backend
+Useful flags: `vmware-mcp --check`, `--vm-dir`, `--vmrun`, `--product`, `--guest-user`,
+`--permission-mode`, `--help`.
 
-If you later want to point this at a vCenter Server or ESXi host instead of local VMs:
+## Tips
 
-```bash
-export VMWARE_BACKEND=vsphere          # or just set VMWARE_HOST — that selects vSphere automatically
-export VMWARE_HOST=vcenter.example.com
-export VMWARE_USERNAME='svc-mcp@vsphere.local'
-export VMWARE_PASSWORD='...'
-export VMWARE_PERMISSION_MODE=read-only
-vmware-mcp --check
-```
-
-That backend exposes a separate `vsphere_*` tool set (inventory, clusters, hosts, datastores,
-alarms, performance counters, vMotion, …). See the tool descriptions once connected. Local and
-vSphere are not active at the same time — pick one backend per process.
+- **Linked clones** (`clone_type=linked`) are fast and small. Do not delete or heavily change the
+  golden image while linked clones still depend on it.
+- **Guest credentials** should be a local admin on the golden image, not your daily Windows login.
+- Start in `read-only` if you only want the AI to inspect VMs.
+- Passwords never appear in tool output.
 
 ## Development
 
 ```bash
-python -m venv .venv && source .venv/bin/activate   # or .venv\Scripts\activate on Windows
 pip install -e ".[dev]"
-
-pytest                  # no VMware install required
+pytest
 ruff check src tests
-ruff format src tests
 mypy
 ```
 
-The local-backend tests run against a fake `vmrun` and real `.vmx` fixtures, so the real client,
-`.vmx` parser, discovery and tools all execute unmodified. The vSphere backend has its own
-in-memory vCenter double and suite.
-
-### Layout
-
-```
-src/vmware_mcp/
-├── config.py              Backend detection, settings, permission modes
-├── server.py              MCPServer assembly, resources, prompts
-├── cli.py                 Argument parsing, --check, transports
-├── workstation/           Local Workstation / Fusion / Player
-│   ├── vmrun.py           Locate and run vmrun
-│   ├── vmx.py             Parse / edit .vmx files
-│   ├── discovery.py       Find VMs and resolve names/paths/UUIDs
-│   ├── guest.py           Guest commands, file copy, Tools/IP wait
-│   └── client.py          High-level async API
-├── vsphere/               Optional vCenter / ESXi backend (pyVmomi)
-└── tools/
-    ├── workstation/       vmware_* tools
-    └── vsphere/           vsphere_* tools
-```
+Tests use a fake `vmrun` and real `.vmx` fixtures — no VMware install required to run them.
 
 ## License
 

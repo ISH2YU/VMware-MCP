@@ -16,7 +16,7 @@ from pathlib import Path
 
 import anyio
 
-from ..config import Product, WorkstationSettings
+from ..config import Product, Settings
 from ..errors import CommandTimeoutError, VmrunError, VmrunNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -151,7 +151,7 @@ class GuestAuth:
 class VmrunRunner:
     """Runs ``vmrun`` subprocesses with timeouts and useful error messages."""
 
-    def __init__(self, settings: WorkstationSettings) -> None:
+    def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._executable: Path | None = None
 

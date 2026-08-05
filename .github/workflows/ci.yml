@@ -39,17 +39,17 @@ jobs:
       - name: Test
         run: pytest --cov=vmware_mcp --cov-report=term-missing
 
-      - name: Verify the workstation server starts and lists its tools
+      - name: Verify the server lists its tools
         run: |
           python - <<'PY'
           import anyio
-          from pathlib import Path
           import tempfile
-          from vmware_mcp.config import WorkstationSettings, PermissionMode, Product
+          from pathlib import Path
+          from vmware_mcp.config import Settings, PermissionMode, Product
           from vmware_mcp.server import create_server
 
           with tempfile.TemporaryDirectory() as d:
-              settings = WorkstationSettings(
+              settings = Settings(
                   vm_dirs=(Path(d),),
                   product=Product.WORKSTATION,
                   permission_mode=PermissionMode.READ_ONLY,
@@ -58,5 +58,5 @@ jobs:
               tools = anyio.run(server.list_tools)
               assert len(tools) == 20, f"expected 20 tools, found {len(tools)}"
               assert all(t.name.startswith("vmware_") for t in tools)
-              print(f"{len(tools)} workstation tools registered")
+              print(f"{len(tools)} tools registered")
           PY

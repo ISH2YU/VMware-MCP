@@ -4,26 +4,19 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
 
 from mcp.server import MCPServer
 
-from .config import (
-    Backend,
-    BaseSettings,
-    PermissionMode,
-    VSphereSettings,
-    WorkstationSettings,
-    load_settings,
-)
+from .config import PermissionMode, Settings, load_settings
 from .tools import ToolContext, register_all
+from .workstation import WorkstationClient
 
 logger = logging.getLogger(__name__)
 
 SERVER_NAME = "vmware-mcp"
 
 
-def build_instructions(settings: BaseSettings) -> str:
+def build_instructions(settings: Settings) -> str:
     mode = settings.permission_mode
     if mode is PermissionMode.READ_ONLY:
         capability = (
@@ -43,15 +36,14 @@ def build_instructions(settings: BaseSettings) -> str:
             "running them."
         )
 
-    if isinstance(settings, WorkstationSettings):
-        dirs = ", ".join(str(path) for path in settings.vm_dirs) or "(none configured)"
-        guest = (
-            f"Guest credentials are configured for user {settings.guest_username!r}."
-            if settings.has_guest_credentials
-            else "No guest credentials configured — set VMWARE_GUEST_USERNAME / "
-            "VMWARE_GUEST_PASSWORD to run commands inside VMs."
-        )
-        return f"""Tools for local VMware {settings.product.value} VMs.
+    dirs = ", ".join(str(path) for path in settings.vm_dirs) or "(none configured)"
+    guest = (
+        f"Guest credentials are configured for user {settings.guest_username!r}."
+        if settings.has_guest_credentials
+        else "No guest credentials configured — set VMWARE_GUEST_USERNAME / "
+        "VMWARE_GUEST_PASSWORD to run commands inside VMs."
+    )
+    return f"""Tools for local VMware {settings.product.value} VMs on this machine.
 
 {capability}
 
@@ -77,68 +69,30 @@ Listings are paginated. When a result has truncated: true there is more to fetch
 with offset.
 """
 
-    assert isinstance(settings, VSphereSettings)
-    return f"""Tools for VMware vSphere ({settings.endpoint}).
 
-{capability}
-
-Identifying objects: every tool that takes a VM, host, datastore, network or
-cluster accepts its name, its managed object id (`vm-1024`, `host-42`), its UUID
-where one exists, or its inventory path (`/Prod/vm/Tier1/web-01`). Names are
-matched case-insensitively; if several objects share a name the tool reports the
-candidates and their moids instead of guessing.
-
-Working effectively:
-- Start with `vsphere_about` to see the endpoint, version and permission mode.
-- Use `vsphere_search_inventory` when you know a name but not its object type.
-- Listings are paginated. When a result has `truncated: true` there is more to
-  fetch with `offset`.
-- Long operations (clone, migrate, snapshot) return a `task_id`. Pass
-  `wait=false` for slow work and poll with `vsphere_get_task`.
-"""
-
-
-def create_server(settings: BaseSettings | None = None, client: Any | None = None) -> MCPServer:
-    """Build the MCP server for the configured backend.
-
-    ``client`` exists so tests can supply a double; production callers pass
-    settings only (or nothing, and settings are loaded from the environment).
-    """
+def create_server(
+    settings: Settings | None = None, client: WorkstationClient | None = None
+) -> MCPServer:
+    """Build the MCP server, its tools, resources and prompts."""
     resolved = settings or load_settings()
-    backend_client = client or _build_client(resolved)
-    context = ToolContext(client=backend_client, settings=resolved)
+    ws = client or WorkstationClient(resolved)
+    context = ToolContext(client=ws, settings=resolved)
 
-    title = "VMware Workstation" if isinstance(resolved, WorkstationSettings) else "VMware vSphere"
     server = MCPServer(
         name=SERVER_NAME,
-        title=title,
+        title="VMware Workstation",
         version="0.1.0",
         instructions=build_instructions(resolved),
         website_url="https://github.com/ISH2YU/VMware-MCP",
     )
 
     register_all(server, context)
-    if isinstance(resolved, WorkstationSettings):
-        _register_workstation_resources(server, context)
-        _register_workstation_prompts(server)
-    else:
-        _register_vsphere_resources(server, context)
-        _register_vsphere_prompts(server)
+    _register_resources(server, context)
+    _register_prompts(server)
     return server
 
 
-def _build_client(settings: BaseSettings) -> Any:
-    if isinstance(settings, WorkstationSettings):
-        from .workstation import WorkstationClient
-
-        return WorkstationClient(settings)
-    from .vsphere.client import VSphereClient
-
-    assert isinstance(settings, VSphereSettings)
-    return VSphereClient(settings)
-
-
-def _register_workstation_resources(server: MCPServer, context: ToolContext) -> None:
+def _register_resources(server: MCPServer, context: ToolContext) -> None:
     client = context.client
 
     @server.resource(
@@ -161,7 +115,7 @@ def _register_workstation_resources(server: MCPServer, context: ToolContext) -> 
         return json.dumps(await client.get_vm(identifier), indent=2, default=str)
 
 
-def _register_workstation_prompts(server: MCPServer) -> None:
+def _register_prompts(server: MCPServer) -> None:
     @server.prompt(
         name="spin_up_test_vms",
         description="Clone N disposable test VMs from a golden image and prepare them.",
@@ -214,113 +168,10 @@ def _register_workstation_prompts(server: MCPServer) -> None:
         return (
             f"Reset every local VM whose name starts with '{name_prefix}' back to "
             f"snapshot '{snapshot}'.\n\n"
-            "1. vmware_list_vms with name='{name_prefix}*'.\n"
+            f"1. vmware_list_vms with name='{name_prefix}*'.\n"
             "2. For each match: stop it if running, then vmware_revert_snapshot.\n"
             "3. Summarise what was reverted and anything that failed.\n"
         )
 
 
-def _register_vsphere_resources(server: MCPServer, context: ToolContext) -> None:
-    from pyVmomi import vim
-
-    from .vsphere import lookup, mappers
-
-    client = context.client
-
-    @server.resource(
-        "vsphere://inventory/summary",
-        name="Inventory summary",
-        description="Counts and totals for the whole vSphere inventory.",
-        mime_type="application/json",
-    )
-    async def inventory_summary() -> str:
-        index = await client.path_index()
-        datacenters = await client.collect(vim.Datacenter, mappers.DATACENTER_PROPERTIES)
-        clusters = await client.collect(vim.ClusterComputeResource, mappers.CLUSTER_PROPERTIES)
-        hosts = await client.collect(vim.HostSystem, mappers.HOST_PROPERTIES)
-        vms = await client.collect(vim.VirtualMachine, mappers.VM_SUMMARY_PROPERTIES)
-        datastores = await client.collect(vim.Datastore, mappers.DATASTORE_PROPERTIES)
-
-        mapped_vms = [mappers.map_vm_summary(record, index) for record in vms]
-        mapped_hosts = [mappers.map_host(record, index) for record in hosts]
-        mapped_datastores = [mappers.map_datastore(record, index) for record in datastores]
-        capacity = sum(item["capacity_gib"] or 0 for item in mapped_datastores)
-        free = sum(item["free_gib"] or 0 for item in mapped_datastores)
-
-        summary: dict[str, Any] = {
-            "endpoint": context.settings.endpoint,  # type: ignore[attr-defined]
-            "permission_mode": context.settings.permission_mode.value,
-            "datacenters": len(datacenters),
-            "clusters": len(clusters),
-            "hosts": {
-                "total": len(mapped_hosts),
-                "connected": sum(
-                    1 for host in mapped_hosts if host["connection_state"] == "connected"
-                ),
-                "in_maintenance": sum(1 for host in mapped_hosts if host["in_maintenance_mode"]),
-                "cpu_cores": sum(host["cpu_cores"] or 0 for host in mapped_hosts),
-                "memory_gib": round(sum(host["memory_gib"] or 0 for host in mapped_hosts), 2),
-            },
-            "virtual_machines": {
-                "total": sum(1 for vm in mapped_vms if not vm["is_template"]),
-                "powered_on": sum(1 for vm in mapped_vms if vm["power_state"] == "poweredOn"),
-                "templates": sum(1 for vm in mapped_vms if vm["is_template"]),
-                "allocated_vcpus": sum(
-                    vm["cpu_count"] or 0 for vm in mapped_vms if not vm["is_template"]
-                ),
-            },
-            "storage": {
-                "datastores": len(mapped_datastores),
-                "capacity_gib": round(capacity, 2),
-                "free_gib": round(free, 2),
-                "used_percent": mappers.percent(capacity - free, capacity),
-            },
-        }
-        return json.dumps(summary, indent=2)
-
-    @server.resource(
-        "vsphere://vm/{identifier}",
-        name="Virtual machine detail",
-        description="Full configuration and runtime detail for one virtual machine.",
-        mime_type="application/json",
-    )
-    async def vm_detail(identifier: str) -> str:
-        index = await client.path_index()
-        record = await client.resolve(lookup.VM, identifier, index=index)
-        detailed = await client.properties_for(
-            vim.VirtualMachine, record.moid, mappers.VM_DETAIL_PROPERTIES
-        )
-        return json.dumps(mappers.map_vm_detail(detailed, index), indent=2, default=str)
-
-
-def _register_vsphere_prompts(server: MCPServer) -> None:
-    @server.prompt(
-        name="troubleshoot_vm",
-        description="Investigate why a virtual machine is slow, stuck or unreachable.",
-    )
-    def troubleshoot_vm(vm: str) -> str:
-        return (
-            f"Investigate the vSphere virtual machine '{vm}' and explain what is wrong.\n\n"
-            "Work through this in order, using the vsphere_* tools:\n"
-            f"1. vsphere_get_vm for '{vm}'.\n"
-            "2. vsphere_get_performance for the VM and its host.\n"
-            "3. vsphere_list_events and vsphere_list_tasks scoped to the VM.\n"
-            "4. vsphere_list_alarms and vsphere_list_datastores.\n"
-            "Then give the most likely cause, the evidence, and remedial actions."
-        )
-
-    @server.prompt(
-        name="capacity_report",
-        description="Summarise compute and storage capacity, utilisation and risks.",
-    )
-    def capacity_report(scope: str = "the whole environment") -> str:
-        return (
-            f"Produce a vSphere capacity report for {scope}.\n\n"
-            "Gather data with vsphere_list_clusters, vsphere_list_hosts, "
-            "vsphere_get_vm_summary_by_host, vsphere_list_datastores and "
-            "vsphere_list_alarms. Finish with prioritised recommendations."
-        )
-
-
-# Re-export for callers that branch on backend.
-__all__ = ["Backend", "build_instructions", "create_server"]
+__all__ = ["build_instructions", "create_server"]

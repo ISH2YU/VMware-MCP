@@ -1,25 +1,18 @@
-"""Tool modules for whichever backend is configured."""
+"""Tool modules for local VMware Workstation / Fusion / Player."""
 
 from __future__ import annotations
 
 from mcp.server import MCPServer
 
 from ._common import ToolContext
+from .workstation import guest, inventory, lifecycle, power, snapshots
+
+MODULES = (inventory, power, snapshots, lifecycle, guest)
 
 
 def register_all(server: MCPServer, context: ToolContext) -> None:
-    from ..config import Backend, WorkstationSettings
-
-    if isinstance(context.settings, WorkstationSettings) or (
-        getattr(context.settings, "backend", None) is Backend.WORKSTATION
-    ):
-        from . import workstation
-
-        workstation.register_all(server, context)
-    else:
-        from . import vsphere
-
-        vsphere.register_all(server, context)
+    for module in MODULES:
+        module.register(server, context)
 
 
-__all__ = ["ToolContext", "register_all"]
+__all__ = ["MODULES", "ToolContext", "register_all"]

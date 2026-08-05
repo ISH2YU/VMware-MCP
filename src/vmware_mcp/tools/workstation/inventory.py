@@ -7,7 +7,7 @@ from typing import Any
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 
-from ...config import WorkstationSettings
+from ...config import Settings
 from .._common import ToolContext, mcp_tool, paginate
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True)
@@ -15,7 +15,7 @@ READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempot
 
 def register(server: MCPServer, context: ToolContext) -> None:
     client = context.client
-    settings: WorkstationSettings = context.settings  # type: ignore[assignment]
+    settings: Settings = context.settings
 
     @mcp_tool(server, annotations=READ_ONLY)
     async def vmware_about() -> dict[str, Any]:

@@ -10,26 +10,23 @@ from typing import Any, TypeVar
 
 from mcp.server import MCPServer
 
-from ..config import BaseSettings
+from ..config import Settings
 from ..errors import InvalidArgumentError
+from ..workstation import WorkstationClient
 
 F = TypeVar("F", bound=Callable[..., Any])
 
 
 @dataclass(frozen=True)
 class ToolContext:
-    """Everything a tool module needs: a backend client and its settings."""
+    """Everything a tool module needs: the Workstation client and its settings."""
 
-    client: Any
-    settings: BaseSettings
+    client: WorkstationClient
+    settings: Settings
 
 
 def mcp_tool(server: MCPServer, **kwargs: Any) -> Callable[[F], F]:
-    """``server.tool`` with the docstring dedented before it reaches the client.
-
-    The SDK passes ``__doc__`` through verbatim, which leaves eight spaces of
-    indentation on every line of a nested tool function's description.
-    """
+    """``server.tool`` with the docstring dedented before it reaches the client."""
 
     def decorator(func: F) -> F:
         description = inspect.cleandoc(func.__doc__) if func.__doc__ else None
@@ -52,7 +49,6 @@ def name_matches(value: str | None, pattern: str | None) -> bool:
 
 
 def equals_any(value: str | None, allowed: Sequence[str] | None) -> bool:
-    """True when ``allowed`` is empty or contains ``value`` (case-insensitively)."""
     if not allowed:
         return True
     if value is None:
@@ -60,7 +56,7 @@ def equals_any(value: str | None, allowed: Sequence[str] | None) -> bool:
     return value.lower() in {item.lower() for item in allowed}
 
 
-def resolve_limit(limit: int | None, settings: BaseSettings) -> int:
+def resolve_limit(limit: int | None, settings: Settings) -> int:
     if limit is None:
         return settings.default_page_size
     if limit < 1:
@@ -69,14 +65,8 @@ def resolve_limit(limit: int | None, settings: BaseSettings) -> int:
 
 
 def paginate(
-    items: Sequence[Any], *, limit: int | None, offset: int, settings: BaseSettings
+    items: Sequence[Any], *, limit: int | None, offset: int, settings: Settings
 ) -> tuple[list[Any], dict[str, Any]]:
-    """Slice ``items`` and describe the slice.
-
-    Listings are capped so a folder with hundreds of VMs cannot blow up a
-    model's context window; ``truncated`` tells the caller to page rather than
-    assume it has seen everything.
-    """
     if offset < 0:
         raise InvalidArgumentError("offset cannot be negative.")
     effective_limit = resolve_limit(limit, settings)

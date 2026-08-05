@@ -11,14 +11,7 @@ from collections.abc import Sequence
 
 import anyio
 
-from .config import (
-    ENV_PREFIX,
-    BaseSettings,
-    VSphereSettings,
-    WorkstationSettings,
-    detect_backend,
-    load_settings,
-)
+from .config import ENV_PREFIX, Settings, load_settings
 from .errors import VMwareMCPError
 
 logger = logging.getLogger("vmware_mcp")
@@ -28,18 +21,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vmware-mcp",
         description=(
-            "Model Context Protocol server for VMware. Defaults to local Workstation / "
-            f"Fusion / Player. Point {ENV_PREFIX}HOST at a vCenter to use the vSphere "
-            "backend instead. Configuration comes from environment variables; flags override."
+            "Model Context Protocol server for local VMware Workstation, Fusion or Player. "
+            f"Configuration comes from {ENV_PREFIX}* environment variables; flags override them."
         ),
     )
-    parser.add_argument(
-        "--backend",
-        choices=["workstation", "vsphere"],
-        help="Force a backend. Default: workstation, unless VMWARE_HOST is set.",
-    )
-
-    local = parser.add_argument_group("local Workstation / Fusion")
+    local = parser.add_argument_group("VMware Workstation / Fusion")
     local.add_argument("--vmrun", metavar="PATH", help="Path to the vmrun executable.")
     local.add_argument(
         "--product",
@@ -54,20 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory to scan for .vmx files. Repeatable. Overrides VMWARE_VM_DIRS.",
     )
     local.add_argument("--guest-user", metavar="USER", help="Default guest OS username.")
-
-    remote = parser.add_argument_group("vSphere (vCenter / ESXi)")
-    remote.add_argument("--vsphere-host", metavar="HOST", help="vCenter or ESXi hostname.")
-    remote.add_argument("--vsphere-port", type=int, metavar="PORT", help="Default 443.")
-    remote.add_argument("--username", metavar="USER", help="vSphere username.")
-    remote.add_argument(
-        "--insecure",
-        action="store_true",
-        help="Skip TLS certificate verification. Lab use only.",
-    )
-    remote.add_argument("--ca-bundle", metavar="PATH", help="CA certificate bundle to trust.")
-
-    shared = parser.add_argument_group("shared")
-    shared.add_argument(
+    local.add_argument(
         "--permission-mode",
         choices=["read-only", "write", "destructive"],
         help="How much the server is allowed to change. Default read-only.",
@@ -87,25 +60,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Verify the backend is reachable, print a short summary and exit.",
+        help="Find vmrun, scan VM directories, print a short summary and exit.",
     )
     return parser
 
 
-def settings_from_args(args: argparse.Namespace) -> BaseSettings:
+def settings_from_args(args: argparse.Namespace) -> Settings:
     """Environment settings with the CLI overrides applied on top."""
     overrides: dict[str, str | None] = {
-        f"{ENV_PREFIX}BACKEND": args.backend,
         f"{ENV_PREFIX}VMRUN_PATH": args.vmrun,
         f"{ENV_PREFIX}PRODUCT": args.product,
         f"{ENV_PREFIX}GUEST_USERNAME": args.guest_user,
-        f"{ENV_PREFIX}HOST": args.vsphere_host,
-        f"{ENV_PREFIX}PORT": str(args.vsphere_port) if args.vsphere_port else None,
-        f"{ENV_PREFIX}USERNAME": args.username,
-        f"{ENV_PREFIX}CA_BUNDLE": args.ca_bundle,
         f"{ENV_PREFIX}PERMISSION_MODE": args.permission_mode,
         f"{ENV_PREFIX}LOG_LEVEL": args.log_level,
-        f"{ENV_PREFIX}VERIFY_SSL": "false" if args.insecure else None,
     }
     if args.vm_dirs:
         overrides[f"{ENV_PREFIX}VM_DIRS"] = os.pathsep.join(args.vm_dirs)
@@ -124,40 +91,17 @@ def configure_logging(level: str) -> None:
     )
 
 
-async def check_connection(settings: BaseSettings) -> int:
-    """Verify the backend and print a short summary."""
-    if isinstance(settings, WorkstationSettings):
-        from .workstation import WorkstationClient
+async def check_connection(settings: Settings) -> int:
+    """Verify vmrun and print a short inventory summary."""
+    from .workstation import WorkstationClient
 
-        client = WorkstationClient(settings)
-        try:
-            report = await client.about()
-            print(json.dumps(report, indent=2))
-            return 0
-        finally:
-            await client.close()
-
-    assert isinstance(settings, VSphereSettings)
-    from .vsphere import mappers
-    from .vsphere.client import VSphereClient
-
-    vsphere = VSphereClient(settings)
+    client = WorkstationClient(settings)
     try:
-        info = await vsphere.about()
-        index = await vsphere.path_index()
-        report = {
-            "backend": "vsphere",
-            "endpoint": settings.endpoint,
-            "permission_mode": settings.permission_mode.value,
-            "verify_ssl": settings.verify_ssl,
-            "authenticated_as": info["session_user"],
-            "server": mappers.map_about_info(info["about"]),
-            "inventory_objects_indexed": index.size,
-        }
+        report = await client.about()
         print(json.dumps(report, indent=2))
         return 0
     finally:
-        await vsphere.close()
+        await client.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -180,21 +124,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     from .server import create_server
 
     server = create_server(settings)
-    target = (
-        f"local {settings.product.value}"
-        if isinstance(settings, WorkstationSettings)
-        else settings.endpoint  # type: ignore[attr-defined]
-    )
     logger.info(
-        "Starting vmware-mcp (%s) against %s in %s mode over %s",
-        detect_backend(os.environ).value if args.backend is None else args.backend,
-        target,
+        "Starting vmware-mcp for local %s in %s mode over %s",
+        settings.product.value,
         settings.permission_mode.value,
         args.transport,
     )
-    # Prefer the settings' own backend tag for the log line.
-    logger.info("Backend: %s", settings.backend.value)
-
     if args.transport == "stdio":
         server.run("stdio")
     else:

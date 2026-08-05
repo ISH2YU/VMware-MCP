@@ -8,7 +8,7 @@ import pytest
 from mcp import Client
 
 from fake_vmrun import FakeVmrun, write_vmx
-from vmware_mcp.config import PermissionMode, Product, WorkstationSettings
+from vmware_mcp.config import PermissionMode, Product, Settings
 from vmware_mcp.errors import AmbiguousObjectError, InvalidArgumentError, ObjectNotFoundError
 from vmware_mcp.server import create_server
 from vmware_mcp.workstation.client import WorkstationClient
@@ -30,8 +30,8 @@ def fake(tmp_path: Path) -> FakeVmrun:
 
 
 @pytest.fixture
-def settings(vm_root: Path) -> WorkstationSettings:
-    return WorkstationSettings(
+def settings(vm_root: Path) -> Settings:
+    return Settings(
         vm_dirs=(vm_root,),
         product=Product.WORKSTATION,
         permission_mode=PermissionMode.DESTRUCTIVE,
@@ -42,12 +42,12 @@ def settings(vm_root: Path) -> WorkstationSettings:
 
 
 @pytest.fixture
-def client(settings: WorkstationSettings, fake: FakeVmrun) -> WorkstationClient:
+def client(settings: Settings, fake: FakeVmrun) -> WorkstationClient:
     return WorkstationClient(settings, runner=fake)  # type: ignore[arg-type]
 
 
 @pytest.fixture
-def server(client: WorkstationClient, settings: WorkstationSettings):
+def server(client: WorkstationClient, settings: Settings):
     return create_server(settings, client=client)
 
 
@@ -318,7 +318,7 @@ async def test_power_tool(server, fake: FakeVmrun):
 
 
 async def test_read_only_mode_blocks_cloning(vm_root: Path, fake: FakeVmrun):
-    settings = WorkstationSettings(
+    settings = Settings(
         vm_dirs=(vm_root,),
         product=Product.WORKSTATION,
         permission_mode=PermissionMode.READ_ONLY,

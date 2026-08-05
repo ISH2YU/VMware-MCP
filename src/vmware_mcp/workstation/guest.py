@@ -10,7 +10,7 @@ from typing import Any
 
 import anyio
 
-from ..config import WorkstationSettings
+from ..config import Settings
 from ..errors import GuestOperationError, InvalidArgumentError
 from .vmrun import GuestAuth, VmrunRunner
 from .vmx import guest_os_family
@@ -43,7 +43,7 @@ class GuestCommandResult:
 class GuestOps:
     """Run programs and move files through VMware Tools."""
 
-    def __init__(self, runner: VmrunRunner, settings: WorkstationSettings) -> None:
+    def __init__(self, runner: VmrunRunner, settings: Settings) -> None:
         self._runner = runner
         self._settings = settings
 
