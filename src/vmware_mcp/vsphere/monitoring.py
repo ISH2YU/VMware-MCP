@@ -37,6 +37,26 @@ def _since(hours: float | None) -> datetime | None:
     return datetime.now(timezone.utc) - timedelta(hours=hours)
 
 
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _newest_first(items: list[Any], *timestamp_fields: str) -> list[Any]:
+    """Sort by the first populated timestamp field, most recent first.
+
+    The ordering of a collector's ``latestPage`` is not something to rely on,
+    and entries can be missing a timestamp entirely, so sort explicitly.
+    """
+
+    def key(item: Any) -> datetime:
+        for field in timestamp_fields:
+            value = getattr(item, field, None)
+            if isinstance(value, datetime):
+                return value
+        return _EPOCH
+
+    return sorted(items, key=key, reverse=True)
+
+
 def query_events(
     service_instance: vim.ServiceInstance,
     *,
@@ -65,8 +85,7 @@ def query_events(
         events = list(collector.latestPage or [])
     finally:
         _destroy(collector)
-    events.reverse()  # latestPage is oldest-first within the page
-    return [map_event(event) for event in events[:max_count]]
+    return [map_event(event) for event in _newest_first(events, "createdTime")[:max_count]]
 
 
 def query_tasks(
@@ -99,8 +118,8 @@ def query_tasks(
         tasks = list(collector.latestPage or [])
     finally:
         _destroy(collector)
-    tasks.reverse()
-    return [map_task_info(task) for task in tasks[:max_count]]
+    ordered = _newest_first(tasks, "startTime", "queueTime", "completeTime")
+    return [map_task_info(task) for task in ordered[:max_count]]
 
 
 def query_triggered_alarms(service_instance: vim.ServiceInstance) -> list[dict[str, Any]]:

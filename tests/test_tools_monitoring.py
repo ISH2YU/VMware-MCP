@@ -18,6 +18,26 @@ async def test_list_events_returns_newest_first(server):
     assert result["events"][0]["user"] == "admin"
 
 
+async def test_events_are_sorted_by_time_not_by_page_order(server, fake_session):
+    # vCenter's documented page ordering is not something to depend on.
+    fake_session.instance.events.reverse()
+    result = await call_ok(server, "vsphere_list_events")
+    assert [event["message"] for event in result["events"]] == [
+        "web-01 powered on",
+        "web-01 reconfigured",
+        "web-01 powered off",
+    ]
+
+
+async def test_tasks_are_sorted_by_time_not_by_page_order(server, fake_session):
+    fake_session.instance.tasks.reverse()
+    result = await call_ok(server, "vsphere_list_tasks")
+    assert [task["operation"] for task in result["tasks"]] == [
+        "VirtualMachine.reconfigure",
+        "VirtualMachine.powerOn",
+    ]
+
+
 async def test_list_events_passes_filters_through_to_vcenter(server, fake_session):
     await call_ok(
         server, "vsphere_list_events", entity="web-01", hours=6, categories=["error", "warning"]
