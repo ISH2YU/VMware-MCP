@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: |
+          ruff check src tests
+          ruff format --check src tests
+
+      - name: Type check
+        run: mypy
+
+      - name: Test
+        run: pytest --cov=vmware_mcp --cov-report=term-missing
+
+      - name: Verify the server starts and lists its tools
+        run: |
+          python - <<'PY'
+          import anyio
+          from vmware_mcp.config import Settings
+          from vmware_mcp.server import create_server
+
+          settings = Settings(host="vcenter.invalid", username="u", password="p")
+          server = create_server(settings)
+          tools = anyio.run(server.list_tools)
+          assert len(tools) == 27, f"expected 27 tools, found {len(tools)}"
+          print(f"{len(tools)} tools registered")
+          PY
