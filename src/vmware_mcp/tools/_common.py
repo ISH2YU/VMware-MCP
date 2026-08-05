@@ -10,19 +10,18 @@ from typing import Any, TypeVar
 
 from mcp.server import MCPServer
 
-from ..config import Settings
+from ..config import BaseSettings
 from ..errors import InvalidArgumentError
-from ..vsphere.client import VSphereClient
 
 F = TypeVar("F", bound=Callable[..., Any])
 
 
 @dataclass(frozen=True)
 class ToolContext:
-    """Everything a tool module needs to talk to vSphere."""
+    """Everything a tool module needs: a backend client and its settings."""
 
-    client: VSphereClient
-    settings: Settings
+    client: Any
+    settings: BaseSettings
 
 
 def mcp_tool(server: MCPServer, **kwargs: Any) -> Callable[[F], F]:
@@ -61,7 +60,7 @@ def equals_any(value: str | None, allowed: Sequence[str] | None) -> bool:
     return value.lower() in {item.lower() for item in allowed}
 
 
-def resolve_limit(limit: int | None, settings: Settings) -> int:
+def resolve_limit(limit: int | None, settings: BaseSettings) -> int:
     if limit is None:
         return settings.default_page_size
     if limit < 1:
@@ -70,13 +69,13 @@ def resolve_limit(limit: int | None, settings: Settings) -> int:
 
 
 def paginate(
-    items: Sequence[Any], *, limit: int | None, offset: int, settings: Settings
+    items: Sequence[Any], *, limit: int | None, offset: int, settings: BaseSettings
 ) -> tuple[list[Any], dict[str, Any]]:
     """Slice ``items`` and describe the slice.
 
-    Listings are capped so a datacenter with 10k VMs cannot blow up a model's
-    context window; ``truncated`` tells the caller to page rather than assume
-    it has seen everything.
+    Listings are capped so a folder with hundreds of VMs cannot blow up a
+    model's context window; ``truncated`` tells the caller to page rather than
+    assume it has seen everything.
     """
     if offset < 0:
         raise InvalidArgumentError("offset cannot be negative.")

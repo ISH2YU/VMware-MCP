@@ -5,12 +5,23 @@ build-backend = "hatchling.build"
 [project]
 name = "vmware-mcp"
 version = "0.1.0"
-description = "Model Context Protocol server for VMware vSphere, vCenter Server and standalone ESXi hosts"
+description = "Model Context Protocol server for local VMware Workstation/Fusion/Player (and optionally vSphere)"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [{ name = "Ishayu Potey" }]
-keywords = ["mcp", "model-context-protocol", "vmware", "vsphere", "vcenter", "esxi", "pyvmomi"]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "vmware",
+    "workstation",
+    "fusion",
+    "player",
+    "vmrun",
+    "vsphere",
+    "vcenter",
+    "esxi",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: System Administrators",

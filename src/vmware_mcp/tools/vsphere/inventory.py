@@ -8,9 +8,9 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pyVmomi import vim
 
-from ..vsphere import lookup, mappers
-from ..vsphere.query import InventoryPathIndex, ObjectRecord, moid_of
-from ._common import ToolContext, mcp_tool, name_matches, paginate, sort_by_name
+from ...vsphere import lookup, mappers
+from ...vsphere.query import InventoryPathIndex, ObjectRecord, moid_of
+from .._common import ToolContext, mcp_tool, name_matches, paginate, sort_by_name
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True)
 

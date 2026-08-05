@@ -11,13 +11,13 @@ from mcp.types import CallToolResult
 sys.path.insert(0, str(Path(__file__).parent))
 
 from fake_vsphere import FakeInventory, FakeSession, build_inventory
-from vmware_mcp.config import PermissionMode, Settings
+from vmware_mcp.config import PermissionMode, VSphereSettings
 from vmware_mcp.server import create_server
 from vmware_mcp.tools import ToolContext
 from vmware_mcp.vsphere.client import VSphereClient
 
 
-def make_settings(**overrides: Any) -> Settings:
+def make_settings(**overrides: Any) -> VSphereSettings:
     defaults: dict[str, Any] = {
         "host": "vcenter.lab.local",
         "username": "svc-mcp@vsphere.local",
@@ -26,7 +26,7 @@ def make_settings(**overrides: Any) -> Settings:
         "cache_ttl": 0,
     }
     defaults.update(overrides)
-    return Settings(**defaults)
+    return VSphereSettings(**defaults)
 
 
 @pytest.fixture
@@ -35,7 +35,7 @@ def inventory() -> FakeInventory:
 
 
 @pytest.fixture
-def settings() -> Settings:
+def settings() -> VSphereSettings:
     return make_settings()
 
 
@@ -45,18 +45,18 @@ def fake_session(inventory: FakeInventory) -> FakeSession:
 
 
 @pytest.fixture
-def client(fake_session: FakeSession, settings: Settings) -> VSphereClient:
+def client(fake_session: FakeSession, settings: VSphereSettings) -> VSphereClient:
     return VSphereClient(settings, session=fake_session)
 
 
 @pytest.fixture
-def context(client: VSphereClient, settings: Settings) -> ToolContext:
+def context(client: VSphereClient, settings: VSphereSettings) -> ToolContext:
     return ToolContext(client=client, settings=settings)
 
 
 @pytest.fixture
 def server_factory(fake_session: FakeSession):
-    """Build a server wired to the fake inventory at a chosen permission mode."""
+    """Build a vSphere-backed server at a chosen permission mode."""
 
     def factory(permission_mode: PermissionMode = PermissionMode.READ_ONLY):
         settings = make_settings(permission_mode=permission_mode)

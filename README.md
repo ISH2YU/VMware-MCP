@@ -1,32 +1,60 @@
 # VMware MCP
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server for VMware vSphere. It gives an
-AI assistant read access to your vCenter Server or standalone ESXi host — inventory, performance
-counters, events and alarms — and, when you explicitly allow it, the ability to power VMs on and
-off, take snapshots, clone, reconfigure and migrate them.
+A [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI assistant drive
+**VMware Workstation, Fusion or Player on your own machine** — list VMs, power them on and off,
+take snapshots, clone a golden Windows image into a pile of disposable test VMs, copy installers
+in, run commands inside the guest, and tear everything down again.
 
-It talks to vSphere with [pyVmomi](https://github.com/vmware/pyvmomi), the official VMware Python
-SDK, over the same vSphere Web Services API the vSphere Client uses. No agent, no appliance, and
-nothing to install on your hosts.
+It talks to the local hypervisor through VMware's `vmrun` command-line tool. No vCenter, no
+appliance, nothing to install on the guests beyond VMware Tools (which you want anyway).
 
-> **Read-only by default.** Out of the box the server refuses every operation that would change
-> your environment. Enabling writes is a deliberate, separate step.
+There is also an optional **vSphere** backend for vCenter Server / ESXi if you need it later; the
+default is local.
+
+> **Read-only by default.** Out of the box the server refuses every operation that would change a
+> VM. Enabling writes (cloning, power, guest commands) is a deliberate step.
+
+## Why this exists
+
+The workflow it is built for:
+
+1. Keep one golden Windows VM (say `win11-golden`) with VMware Tools, updates and a clean
+   `golden` snapshot.
+2. Ask the AI to spin up N linked clones from that snapshot for a test run.
+3. Have it wait until Tools is up, copy an installer in, run a silent install, capture the result
+   (and a screenshot if it fails).
+4. Revert or delete the clones when you are done.
+
+That is what `vmware_clone_many`, `vmware_wait_for_guest`, `vmware_copy_to_guest`,
+`vmware_run_command` and `vmware_revert_snapshot` are for.
 
 ## Contents
 
+- [Requirements](#requirements)
 - [Quick start](#quick-start)
-- [Configuring an MCP client](#configuring-an-mcp-client)
+- [Configure an MCP client](#configure-an-mcp-client)
 - [Permission modes](#permission-modes)
+- [Typical workflows](#typical-workflows)
 - [Tools](#tools)
 - [Resources and prompts](#resources-and-prompts)
 - [Configuration reference](#configuration-reference)
-- [Referring to objects](#referring-to-objects)
+- [Referring to VMs](#referring-to-vms)
 - [Security notes](#security-notes)
+- [Optional: vSphere backend](#optional-vsphere-backend)
 - [Development](#development)
 
-## Quick start
+## Requirements
 
-Requires Python 3.10 or newer and network access to port 443 on vCenter or ESXi.
+- **VMware Workstation Pro**, **VMware Fusion** or **VMware Player/Workstation Player** installed
+  locally, with the `vmrun` tool available (it ships with all of them).
+- **Python 3.10+**
+- For guest commands (run installer, copy files, etc.): **VMware Tools** inside the guest, plus a
+  guest username/password the server can use.
+
+`vmrun` is usually on `PATH`. If not, set `VMWARE_VMRUN_PATH` (see below for the usual install
+locations).
+
+## Quick start
 
 ```bash
 git clone https://github.com/ISH2YU/VMware-MCP.git
@@ -34,51 +62,55 @@ cd VMware-MCP
 pip install -e .
 ```
 
-Set the connection details and check that they work before wiring anything up to an AI client:
+Point it at the folder where your VMs live and check that it can see them:
 
 ```bash
-export VMWARE_HOST=vcenter.example.com
-export VMWARE_USERNAME='svc-mcp@vsphere.local'
-export VMWARE_PASSWORD='...'
+# Windows example
+set VMWARE_VM_DIRS=%USERPROFILE%\Documents\Virtual Machines
+set VMWARE_PERMISSION_MODE=write
+set VMWARE_GUEST_USERNAME=Administrator
+set VMWARE_GUEST_PASSWORD=...
 
 vmware-mcp --check
 ```
 
-`--check` logs in, prints the vCenter version, the account it authenticated as and the number of
-inventory objects it can see, then exits:
+```bash
+# macOS / Linux example
+export VMWARE_VM_DIRS="$HOME/Virtual Machines.localized"   # Fusion default; adjust for Workstation
+export VMWARE_PERMISSION_MODE=write
+export VMWARE_GUEST_USERNAME=Administrator
+export VMWARE_GUEST_PASSWORD='...'
+
+vmware-mcp --check
+```
+
+`--check` finds `vmrun`, scans your VM directories and prints a summary:
 
 ```json
 {
-  "endpoint": "vcenter.example.com:443",
-  "permission_mode": "read-only",
-  "verify_ssl": true,
-  "authenticated_as": "svc-mcp@vsphere.local",
-  "server": {
-    "name": "VMware vCenter Server 8.0.3 build-24022515",
-    "product": "VMware vCenter Server",
-    "version": "8.0.3",
-    "build": "24022515",
-    "api_version": "8.0.3.0",
-    "api_type": "VirtualCenter",
-    "os_type": "linux-x64",
-    "vendor": "VMware, Inc.",
-    "instance_uuid": "aaaa-bbbb-cccc",
-    "license_product": "VMware VirtualCenter Server"
-  },
-  "inventory_objects_indexed": 214
+  "backend": "workstation",
+  "product": "ws",
+  "vmrun": "C:\\Program Files (x86)\\VMware\\VMware Workstation\\vmrun.exe",
+  "vmrun_version": "vmrun version 1.17.0 build-...",
+  "vm_directories": ["C:\\Users\\you\\Documents\\Virtual Machines"],
+  "vm_count": 4,
+  "running_count": 1,
+  "guest_credentials_configured": true,
+  "connection": {
+    "backend": "workstation",
+    "permission_mode": "write",
+    "product": "ws"
+  }
 }
 ```
 
-If the TLS handshake fails, either point `VMWARE_CA_BUNDLE` at your vCenter's CA certificate or, for
-a lab, set `VMWARE_VERIFY_SSL=false`.
-
-Then run the server. It speaks stdio by default, which is what desktop MCP clients expect:
+Then run the server (stdio is what desktop MCP clients expect):
 
 ```bash
 vmware-mcp
 ```
 
-## Configuring an MCP client
+## Configure an MCP client
 
 ### Cursor
 
@@ -90,243 +122,268 @@ Add to `~/.cursor/mcp.json` (or `.cursor/mcp.json` in a project):
     "vmware": {
       "command": "vmware-mcp",
       "env": {
-        "VMWARE_HOST": "vcenter.example.com",
-        "VMWARE_USERNAME": "svc-mcp@vsphere.local",
-        "VMWARE_PASSWORD": "...",
-        "VMWARE_PERMISSION_MODE": "read-only"
+        "VMWARE_VM_DIRS": "C:\\Users\\you\\Documents\\Virtual Machines",
+        "VMWARE_PERMISSION_MODE": "write",
+        "VMWARE_GUEST_USERNAME": "Administrator",
+        "VMWARE_GUEST_PASSWORD": "..."
       }
     }
   }
 }
 ```
+
+On a Mac with Fusion, set `"VMWARE_PRODUCT": "fusion"` and point `VMWARE_VM_DIRS` at
+`~/Virtual Machines.localized`.
 
 ### Claude Desktop
 
-Add to `claude_desktop_config.json` (macOS:
-`~/Library/Application Support/Claude/claude_desktop_config.json`):
-
-```json
-{
-  "mcpServers": {
-    "vmware": {
-      "command": "vmware-mcp",
-      "env": {
-        "VMWARE_HOST": "vcenter.example.com",
-        "VMWARE_USERNAME": "svc-mcp@vsphere.local",
-        "VMWARE_PASSWORD": "..."
-      }
-    }
-  }
-}
-```
+Same shape in `claude_desktop_config.json`.
 
 ### Over HTTP
-
-To run the server once and share it, use the streamable HTTP transport:
 
 ```bash
 vmware-mcp --transport streamable-http --host 127.0.0.1 --port 8000
 ```
 
-The endpoint has no authentication of its own, so bind it to localhost or put it behind a proxy
-that does.
+Bind to localhost (or put it behind an authenticating proxy). The HTTP endpoint has no auth of its
+own.
 
 ## Permission modes
 
-`VMWARE_PERMISSION_MODE` decides how much damage the server can do. Modes are cumulative.
+`VMWARE_PERMISSION_MODE` decides how much the server can do. Modes are cumulative.
 
 | Mode | What it allows |
 | --- | --- |
-| `read-only` (default) | Inventory, monitoring, events, alarms and performance counters. Every mutating tool refuses with an explanation. |
-| `write` | Adds power operations, snapshot creation, clone, reconfigure and migrate. |
+| `read-only` (default) | List and inspect VMs, list snapshots, wait for guest/Tools. Everything that changes a VM refuses. |
+| `write` | Adds power on/off, create snapshots, clone (including batch), reconfigure, screenshots, and all guest operations (run command, copy files). |
 | `destructive` | Adds deleting VMs and reverting or deleting snapshots. |
 
-The mode is enforced server-side, before any call reaches vCenter, and it is stated in the server
-instructions so the model knows what it can attempt. Deleting a VM additionally requires an explicit
-`confirm=true` argument and refuses while the VM is powered on.
+Deleting a VM additionally requires `confirm=true` and refuses while the VM is powered on.
 
-Belt and braces: give the service account only the vCenter privileges it needs. The permission mode
-protects against a confused model, not against a compromised one — vCenter roles are the real
-boundary.
+For the "spin up Windows test VMs" workflow you want at least `write`. Use `destructive` when you
+also want the AI to revert or delete clones when a run finishes.
+
+## Typical workflows
+
+### Spin up N Windows test VMs from a golden image
+
+Keep a template VM with a clean snapshot named `golden`. Then ask the assistant something like:
+
+> Clone 5 linked VMs from `win11-golden` snapshot `golden`, name them `web-test-01` …
+> `web-test-05`, start them headless, wait until each has Tools and an IP, and list the IPs.
+
+Under the hood that is:
+
+1. `vmware_get_vm` / `vmware_list_snapshots` on the golden image
+2. `vmware_clone_many` with `clone_type=linked`, `snapshot=golden`, `start=true`
+3. `vmware_wait_for_guest` per clone
+4. Report names, paths and IPs
+
+There is a built-in prompt for this: `spin_up_test_vms`.
+
+### Install and test a package on one Windows VM
+
+> On `web-test-01`, copy `C:\Builds\app.msi` to `C:\Temp\app.msi`, install it quietly, and tell me
+> if it worked.
+
+1. `vmware_wait_for_guest`
+2. `vmware_run_command` to ensure `C:\Temp` exists
+3. `vmware_copy_to_guest`
+4. `vmware_run_command` with `msiexec.exe /i C:\Temp\app.msi /qn`
+5. `vmware_screenshot` if the exit code is non-zero
+
+Built-in prompt: `run_windows_test`.
+
+### Reset everything between runs
+
+> Revert every VM named `web-test-*` back to snapshot `golden`.
+
+Built-in prompt: `reset_test_vms`. Or delete them with `vmware_delete_vm` (needs `destructive` +
+`confirm=true`).
 
 ## Tools
 
-All 27 tools are prefixed `vsphere_`.
+All local tools are prefixed `vmware_`.
 
 ### Inventory
 
 | Tool | Purpose |
 | --- | --- |
-| `vsphere_about` | Product, version, API type, authenticated user and the active permission mode. |
-| `vsphere_list_datacenters` | Every datacenter. |
-| `vsphere_list_clusters` | Clusters with capacity, DRS and HA configuration. |
-| `vsphere_list_hosts` | ESXi hosts with hardware, version and live CPU/memory utilisation. |
-| `vsphere_get_host` | One host in full, including its VMs, datastores and networks. |
-| `vsphere_list_resource_pools` | Reservations, limits and current usage. |
-| `vsphere_search_inventory` | Search by name across object types when you don't know what a name refers to. |
+| `vmware_about` | Product, `vmrun` path, VM counts, guest-credential status, permission mode. Call this first. |
+| `vmware_list_vms` | List VMs under the configured directories. Filter by name, guest OS, family, running/off. |
+| `vmware_get_vm` | One VM in full: CPU, memory, disks, NICs, Tools state, IP, snapshots. |
+| `vmware_list_running` | `.vmx` paths of every VM currently powered on. |
 
-### Virtual machines
-
-| Tool | Purpose |
-| --- | --- |
-| `vsphere_list_vms` | VMs filtered by name, power state, datacenter, cluster, host, guest OS or IP. |
-| `vsphere_get_vm` | One VM in full: hardware, disks, NICs, guest networking and filesystems, snapshots. |
-| `vsphere_get_vm_summary_by_host` | VM counts and vCPU/memory overcommitment per host. |
-
-### Storage and networking
-
-| Tool | Purpose |
-| --- | --- |
-| `vsphere_list_datastores` | Capacity, free space, provisioned space and over-provisioning. |
-| `vsphere_list_networks` | Standard port groups, distributed port groups (with VLAN and switch) and opaque networks. |
-
-### Monitoring
-
-| Tool | Purpose |
-| --- | --- |
-| `vsphere_list_tasks` | Recent tasks, optionally scoped to an object. |
-| `vsphere_get_task` | Poll a single task by id. |
-| `vsphere_list_running_tasks` | What vCenter is doing right now. |
-| `vsphere_list_events` | The audit trail: logins, changes, HA actions, hardware problems. |
-| `vsphere_list_alarms` | Every currently triggered alarm, red first. |
-| `vsphere_get_performance` | CPU, memory, disk and network counters for a VM or host, summarised. |
-
-### Power, snapshots and lifecycle
+### Power
 
 | Tool | Mode | Purpose |
 | --- | --- | --- |
-| `vsphere_change_vm_power_state` | `write` | Power on/off, suspend, reset, or ask the guest to shut down or reboot. |
-| `vsphere_list_snapshots` | read | Snapshot tree plus a flat list with paths. |
-| `vsphere_create_snapshot` | `write` | Take a snapshot, optionally with memory or quiesced. |
-| `vsphere_revert_to_snapshot` | `destructive` | Revert, discarding later changes. |
-| `vsphere_delete_snapshot` | `destructive` | Delete one snapshot, a subtree, or all of them. |
-| `vsphere_clone_vm` | `write` | Clone a VM or deploy from a template. |
-| `vsphere_reconfigure_vm` | `write` | Change vCPU count, cores per socket, memory or notes. |
-| `vsphere_migrate_vm` | `write` | vMotion, storage vMotion, or both. |
-| `vsphere_delete_vm` | `destructive` | Delete a VM and its disks. Needs `confirm=true`. |
+| `vmware_power_vm` | `write` | `start`, `stop`, `reset`, `suspend`, `pause`, `unpause`, `hard_stop`, `hard_reset`. Soft stop/reset ask the guest via Tools; hard_* pull the plug. `gui=false` (default) starts headless. |
 
-Long operations (clone, migrate, snapshot) accept `wait=false` and return a `task_id` you can poll
-with `vsphere_get_task`. When waiting, progress is streamed to the client as MCP progress
-notifications.
+### Snapshots
+
+| Tool | Mode | Purpose |
+| --- | --- | --- |
+| `vmware_list_snapshots` | read | Snapshot names on a VM. |
+| `vmware_create_snapshot` | `write` | Take a snapshot (e.g. `golden` on the template). |
+| `vmware_revert_snapshot` | `destructive` | Roll a VM back, discarding later changes. |
+| `vmware_delete_snapshot` | `destructive` | Delete a snapshot, optionally with children. |
+
+### Clone / reconfigure / delete
+
+| Tool | Mode | Purpose |
+| --- | --- | --- |
+| `vmware_clone_vm` | `write` | Clone one VM. Prefer `clone_type=linked` + `snapshot=...` for test labs. |
+| `vmware_clone_many` | `write` | Clone N VMs as `{prefix}-01` … `{prefix}-N` (max 50). Continues past individual failures. |
+| `vmware_reconfigure_vm` | `write` | Change display name, CPU, memory or notes. VM must be powered off; edits the `.vmx`. |
+| `vmware_delete_vm` | `destructive` | Delete a VM and its files. Needs `confirm=true`. |
+| `vmware_screenshot` | `write` | Capture a PNG of a running VM's display. |
+
+### Guest operations (need Tools + credentials)
+
+| Tool | Mode | Purpose |
+| --- | --- | --- |
+| `vmware_wait_for_guest` | read | Block until Tools is running, optionally until an IP is assigned. |
+| `vmware_run_command` | `write` | Run a program in the guest; returns exit code, stdout and stderr. |
+| `vmware_run_script` | `write` | Upload a short script and run it (handy for multi-line PowerShell). |
+| `vmware_copy_to_guest` | `write` | Copy a host file into the guest. |
+| `vmware_copy_from_guest` | `write` | Copy a guest file out to the host. |
+| `vmware_list_guest_directory` | read | List a directory inside the guest. |
+
+Guest credentials come from `VMWARE_GUEST_USERNAME` / `VMWARE_GUEST_PASSWORD`, or can be passed per
+call. On Windows, `program` is usually `cmd.exe` or `powershell.exe`.
 
 ## Resources and prompts
 
-Two resources:
+Resources:
 
-- `vsphere://inventory/summary` — counts and totals for the whole environment, useful as ambient
-  context.
-- `vsphere://vm/{identifier}` — full detail for one VM, by name, moid, UUID or path.
+- `vmware://vms` — every discovered local VM
+- `vmware://vm/{identifier}` — full detail for one VM
 
-Two prompts:
+Prompts:
 
-- `troubleshoot_vm(vm)` — a diagnostic walkthrough for a slow, stuck or unreachable VM: performance
-  counters for the VM and its host, recent events and tasks, alarms, snapshot age and datastore
-  pressure.
-- `capacity_report(scope)` — cluster and host utilisation, overcommitment ratios, datastores nearing
-  full, and a prioritised list of recommendations.
+- `spin_up_test_vms(template, count, name_prefix, snapshot)` — clone N disposable VMs from a golden image
+- `run_windows_test(vm, installer_host_path, guest_path)` — copy, install, report
+- `reset_test_vms(name_prefix, snapshot)` — revert a batch back to clean
 
 ## Configuration reference
 
-Every setting is an environment variable; the flags shown override them.
-
 | Variable | Default | Description |
 | --- | --- | --- |
-| `VMWARE_HOST` | *required* | vCenter Server or ESXi hostname or IP. Also `VSPHERE_HOST`. |
-| `VMWARE_USERNAME` | *required* | vSphere account. Also `VMWARE_USER`, `VSPHERE_USER`. |
-| `VMWARE_PASSWORD` | *required* | Password. Also `VSPHERE_PASSWORD`. |
-| `VMWARE_PORT` | `443` | API port. |
-| `VMWARE_VERIFY_SSL` | `true` | Verify the TLS certificate. |
-| `VMWARE_INSECURE` | `false` | Shorthand for disabling verification. |
-| `VMWARE_CA_BUNDLE` | — | CA certificate bundle to trust instead of the system store. |
+| `VMWARE_BACKEND` | auto | `workstation` (default) or `vsphere`. Auto: vSphere if `VMWARE_HOST` is set, else local. |
+| `VMWARE_VM_DIRS` | platform default | Directories to scan for `.vmx` files. Use the OS path separator to list several. |
+| `VMWARE_VMRUN_PATH` | auto-detect | Full path to `vmrun` if it is not on `PATH`. |
+| `VMWARE_PRODUCT` | auto | `ws` (Workstation), `fusion`, or `player`. Auto: `fusion` on macOS, `ws` elsewhere. |
+| `VMWARE_GUEST_USERNAME` | — | Default guest OS username for guest operations. |
+| `VMWARE_GUEST_PASSWORD` | — | Default guest OS password. |
 | `VMWARE_PERMISSION_MODE` | `read-only` | `read-only`, `write` or `destructive`. |
-| `VMWARE_CONNECT_TIMEOUT` | `30` | HTTP connection timeout in seconds. |
-| `VMWARE_TASK_TIMEOUT` | `600` | How long to wait for a vSphere task before handing back its id. |
+| `VMWARE_COMMAND_TIMEOUT` | `120` | Seconds before a `vmrun` call is killed. Raise this for big full clones. |
+| `VMWARE_GUEST_TIMEOUT` | `300` | Seconds for guest program runs and file copies. |
+| `VMWARE_BOOT_TIMEOUT` | `300` | Seconds to wait for Tools / guest IP after power on. |
+| `VMWARE_MAX_OUTPUT_BYTES` | `100000` | Cap on captured guest stdout/stderr. |
 | `VMWARE_MAX_RESULTS` | `500` | Hard cap on items returned by any listing. |
 | `VMWARE_DEFAULT_PAGE_SIZE` | `100` | Page size when a tool call omits `limit`. |
-| `VMWARE_CACHE_TTL` | `60` | Seconds to cache the inventory tree used for path resolution. |
-| `VMWARE_MAX_CONCURRENCY` | `8` | Maximum simultaneous calls to vCenter. |
-| `VMWARE_LOG_LEVEL` | `INFO` | Log level. Logs go to stderr. |
+| `VMWARE_LOG_LEVEL` | `INFO` | Logs go to stderr (stdout is the MCP protocol). |
 | `VMWARE_TRANSPORT` | `stdio` | `stdio`, `streamable-http` or `sse`. |
 
-Command line flags: `--vsphere-host`, `--vsphere-port`, `--username`, `--insecure`, `--ca-bundle`,
+### Where `vmrun` usually lives
+
+| Platform | Typical path |
+| --- | --- |
+| Windows | `C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe` |
+| macOS | `/Applications/VMware Fusion.app/Contents/Public/vmrun` |
+| Linux | `/usr/bin/vmrun` |
+
+### Where VMs usually live
+
+| Platform | Typical folder |
+| --- | --- |
+| Windows | `%USERPROFILE%\Documents\Virtual Machines` |
+| macOS (Fusion) | `~/Virtual Machines.localized` |
+| Linux | `~/vmware` |
+
+Command-line flags: `--backend`, `--vmrun`, `--product`, `--vm-dir` (repeatable), `--guest-user`,
 `--permission-mode`, `--transport`, `--host`, `--port`, `--log-level`, `--check`. Run
-`vmware-mcp --help` for details. There is deliberately no `--password` flag; passwords on a command
+`vmware-mcp --help` for details. There is deliberately no password flag — passwords on a command
 line end up in the process list and shell history.
 
-## Referring to objects
+## Referring to VMs
 
-Every tool that takes a VM, host, datastore, network or cluster accepts any of:
+Every tool that takes a VM accepts any of:
 
-- the object name — `web-01`, matched case-insensitively
-- a glob, where a name filter is accepted — `web-*`, `db-0?`
-- the managed object id — `vm-1024`, `host-42`
-- a UUID, for VMs and hosts — BIOS or instance UUID
-- the inventory path — `/Prod/vm/Tier1/web-01`, or any suffix of it
+- the display name — `win11-golden` (case-insensitive)
+- a glob, where a name filter is accepted — `web-test-*`
+- the full `.vmx` path
+- the directory / stem name
+- the BIOS UUID from the `.vmx`
 
-When several objects match, the tool lists the candidates with their managed object ids rather than
-picking one. Listings are paginated and report `truncated`, so a model can tell the difference
-between "that's all of them" and "there are more".
+When several VMs match, the tool lists the candidates with their paths rather than picking one.
 
 ## Security notes
 
-- **Create a dedicated service account** in vSphere rather than reusing an administrator. Grant it a
-  read-only role for the default mode; add only the specific privileges you need if you enable
-  writes.
-- **The password is never returned** by any tool. `vsphere_about` reports the connection settings
-  with the password omitted.
-- **Certificate verification is on by default.** Disabling it is logged as a warning at startup.
-- **Anything an MCP client can call, a model can call.** Permission modes and the `confirm` flag on
-  deletion exist because prompt injection through, for example, a VM annotation is a real risk. Keep
-  the server in `read-only` unless a task genuinely needs more.
-- **Secrets in client config files** are stored in plain text by most MCP clients. Prefer a secret
+- **Start in `read-only`.** Only raise the permission mode when you actually want the AI to change
+  VMs. Prompt injection (through a VM annotation, a web page the model reads, etc.) is a real risk.
+- **Guest credentials are powerful.** The account in `VMWARE_GUEST_USERNAME` can run arbitrary
+  commands inside every VM the server can see. Use a dedicated local admin on the golden image, not
+  your day-to-day account, and prefer `write` over `destructive` until you need revert/delete.
+- **Passwords never appear in tool output.** `vmware_about` reports whether guest credentials are
+  configured, not what they are.
+- **Linked clones share disks with the parent.** Do not delete or heavily modify the golden image
+  while linked clones still depend on it.
+- **Secrets in MCP client config files** are stored in plain text by most clients. Prefer a secret
   manager or environment variables where your client supports them.
+
+## Optional: vSphere backend
+
+If you later want to point this at a vCenter Server or ESXi host instead of local VMs:
+
+```bash
+export VMWARE_BACKEND=vsphere          # or just set VMWARE_HOST — that selects vSphere automatically
+export VMWARE_HOST=vcenter.example.com
+export VMWARE_USERNAME='svc-mcp@vsphere.local'
+export VMWARE_PASSWORD='...'
+export VMWARE_PERMISSION_MODE=read-only
+vmware-mcp --check
+```
+
+That backend exposes a separate `vsphere_*` tool set (inventory, clusters, hosts, datastores,
+alarms, performance counters, vMotion, …). See the tool descriptions once connected. Local and
+vSphere are not active at the same time — pick one backend per process.
 
 ## Development
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate   # or .venv\Scripts\activate on Windows
 pip install -e ".[dev]"
 
-pytest                     # 200+ tests, no vCenter required
-ruff check src tests       # lint
-ruff format src tests      # format
-mypy                       # type check
+pytest                  # no VMware install required
+ruff check src tests
+ruff format src tests
+mypy
 ```
 
-The test suite runs against an in-memory vCenter double (`tests/fake_vsphere.py`) that implements
-the two seams the server actually depends on: pyVmomi's SOAP stub and the PropertyCollector.
-Everything above those seams — the real client, the real property specs, the real mappers and the
-real tools — runs unmodified, so tests exercise the same code paths that talk to a live vCenter.
+The local-backend tests run against a fake `vmrun` and real `.vmx` fixtures, so the real client,
+`.vmx` parser, discovery and tools all execute unmodified. The vSphere backend has its own
+in-memory vCenter double and suite.
 
-### How it is put together
+### Layout
 
 ```
 src/vmware_mcp/
-├── config.py          Environment parsing and permission modes
-├── errors.py          Error types, all with client-safe messages
-├── server.py          MCPServer assembly, resources and prompts
-├── cli.py             Argument parsing, --check, transports
-├── vsphere/
-│   ├── session.py     Connection, TLS, reconnect on session expiry
-│   ├── client.py      Async facade; runs pyVmomi on a bounded thread pool
-│   ├── query.py       PropertyCollector batching and inventory paths
-│   ├── mappers.py     Pure vSphere-to-JSON translation
-│   ├── lookup.py      Name/moid/UUID/path resolution
-│   ├── tasks.py       Task polling with progress reporting
-│   ├── perf.py        Performance counter queries
-│   └── monitoring.py  Events, tasks and alarms
-└── tools/             One module per area of vSphere
+├── config.py              Backend detection, settings, permission modes
+├── server.py              MCPServer assembly, resources, prompts
+├── cli.py                 Argument parsing, --check, transports
+├── workstation/           Local Workstation / Fusion / Player
+│   ├── vmrun.py           Locate and run vmrun
+│   ├── vmx.py             Parse / edit .vmx files
+│   ├── discovery.py       Find VMs and resolve names/paths/UUIDs
+│   ├── guest.py           Guest commands, file copy, Tools/IP wait
+│   └── client.py          High-level async API
+├── vsphere/               Optional vCenter / ESXi backend (pyVmomi)
+└── tools/
+    ├── workstation/       vmware_* tools
+    └── vsphere/           vsphere_* tools
 ```
-
-Two decisions worth knowing about:
-
-**Everything reads through the PropertyCollector.** Touching managed object attributes one at a time
-costs a round trip each, which is unusable against a vCenter with thousands of VMs. A listing here
-is a single `RetrievePropertiesEx` call regardless of how many objects come back.
-
-**pyVmomi is synchronous, MCP is not.** Blocking calls run on a thread pool bounded by
-`VMWARE_MAX_CONCURRENCY`, and vSphere tasks are polled from the event loop rather than blocking a
-thread, so progress can be streamed and a cancelled request does not strand a worker.
 
 ## License
 

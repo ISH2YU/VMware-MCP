@@ -15,7 +15,7 @@ from typing import Any
 from pyVim.connect import Disconnect, SmartConnect
 from pyVmomi import vim, vmodl
 
-from ..config import Settings
+from ..config import VSphereSettings
 from ..errors import ConnectionFailedError
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 _SESSION_FAULTS = (vim.fault.NotAuthenticated,)
 
 
-def build_ssl_context(settings: Settings) -> ssl.SSLContext:
+def build_ssl_context(settings: VSphereSettings) -> ssl.SSLContext:
     """SSL context honouring ``VMWARE_VERIFY_SSL`` / ``VMWARE_CA_BUNDLE``."""
     if not settings.verify_ssl:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -43,7 +43,7 @@ class VSphereSession:
     serialised here.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: VSphereSettings) -> None:
         self._settings = settings
         self._lock = threading.RLock()
         self._service_instance: vim.ServiceInstance | None = None

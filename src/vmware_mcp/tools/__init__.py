@@ -1,19 +1,25 @@
-"""Tool modules, grouped by the part of vSphere they cover."""
+"""Tool modules for whichever backend is configured."""
 
 from __future__ import annotations
 
 from mcp.server import MCPServer
 
-from . import inventory, lifecycle, monitoring, networking, power, snapshots, storage, vms
 from ._common import ToolContext
-
-#: Registration order determines the order tools are listed to clients.
-MODULES = (inventory, vms, storage, networking, monitoring, power, snapshots, lifecycle)
 
 
 def register_all(server: MCPServer, context: ToolContext) -> None:
-    for module in MODULES:
-        module.register(server, context)
+    from ..config import Backend, WorkstationSettings
+
+    if isinstance(context.settings, WorkstationSettings) or (
+        getattr(context.settings, "backend", None) is Backend.WORKSTATION
+    ):
+        from . import workstation
+
+        workstation.register_all(server, context)
+    else:
+        from . import vsphere
+
+        vsphere.register_all(server, context)
 
 
-__all__ = ["MODULES", "ToolContext", "register_all"]
+__all__ = ["ToolContext", "register_all"]

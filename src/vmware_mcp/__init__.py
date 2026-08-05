@@ -1,4 +1,7 @@
-"""Model Context Protocol server for VMware vSphere, vCenter Server and ESXi."""
+"""Model Context Protocol server for local VMware Workstation / Fusion / Player.
+
+Optionally also speaks to vCenter Server / ESXi via the vSphere backend.
+"""
 
 from __future__ import annotations
 

@@ -10,12 +10,12 @@ from mcp.server.mcpserver import Context
 from mcp.types import ToolAnnotations
 from pyVmomi import vim
 
-from ..config import PermissionMode
-from ..errors import InvalidArgumentError
-from ..vsphere import lookup, mappers
-from ..vsphere.query import moid_of
-from ..vsphere.tasks import run_task
-from ._common import ToolContext, mcp_tool, require_non_empty
+from ...config import PermissionMode
+from ...errors import InvalidArgumentError
+from ...vsphere import lookup, mappers
+from ...vsphere.query import moid_of
+from ...vsphere.tasks import run_task
+from .._common import ToolContext, mcp_tool, require_non_empty
 
 MUTATING = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False)
 DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False)

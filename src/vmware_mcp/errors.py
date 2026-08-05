@@ -40,6 +40,27 @@ class TaskFailedError(VMwareMCPError):
     """A vSphere task finished in the ``error`` state."""
 
 
+class VmrunNotFoundError(VMwareMCPError):
+    """The ``vmrun`` command line tool could not be located."""
+
+
+class VmrunError(VMwareMCPError):
+    """``vmrun`` ran but reported a failure."""
+
+    def __init__(self, message: str, *, command: str = "", exit_code: int | None = None) -> None:
+        super().__init__(message)
+        self.command = command
+        self.exit_code = exit_code
+
+
+class CommandTimeoutError(VMwareMCPError):
+    """A ``vmrun`` invocation did not finish in time and was killed."""
+
+
+class GuestOperationError(VMwareMCPError):
+    """An operation inside the guest OS failed, typically a VMware Tools problem."""
+
+
 class TaskTimeoutError(VMwareMCPError):
     """A vSphere task did not finish within the configured timeout.
 

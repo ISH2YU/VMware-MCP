@@ -10,7 +10,7 @@ from mcp import Client
 from conftest import call_ok
 from vmware_mcp.config import PermissionMode
 from vmware_mcp.server import build_instructions
-from vmware_mcp.tools import MODULES
+from vmware_mcp.tools.vsphere import MODULES
 
 EXPECTED_TOOL_COUNT = 27
 
@@ -116,7 +116,7 @@ async def test_capacity_report_prompt_takes_an_optional_scope(server):
     ("mode", "expected"),
     [
         (PermissionMode.READ_ONLY, "READ-ONLY"),
-        (PermissionMode.WRITE, "may change the environment"),
+        (PermissionMode.WRITE, "may change VMs"),
         (PermissionMode.DESTRUCTIVE, "FULL access"),
     ],
 )

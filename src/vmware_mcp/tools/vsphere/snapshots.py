@@ -9,11 +9,11 @@ from mcp.server.mcpserver import Context
 from mcp.types import ToolAnnotations
 from pyVmomi import vim
 
-from ..config import PermissionMode
-from ..errors import AmbiguousObjectError, ObjectNotFoundError
-from ..vsphere import lookup, mappers
-from ..vsphere.tasks import run_task
-from ._common import ToolContext, mcp_tool, require_non_empty
+from ...config import PermissionMode
+from ...errors import AmbiguousObjectError, ObjectNotFoundError
+from ...vsphere import lookup, mappers
+from ...vsphere.tasks import run_task
+from .._common import ToolContext, mcp_tool, require_non_empty
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True)
 MUTATING = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False)

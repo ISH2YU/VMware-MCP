@@ -12,7 +12,7 @@ import anyio
 import anyio.to_thread
 from pyVmomi import vim, vmodl
 
-from ..config import Settings
+from ..config import VSphereSettings
 from ..errors import (
     ObjectNotFoundError,
     VMwareMCPError,
@@ -61,7 +61,7 @@ class VSphereClient:
     open an unbounded number of connections to vCenter.
     """
 
-    def __init__(self, settings: Settings, session: VSphereSession | None = None) -> None:
+    def __init__(self, settings: VSphereSettings, session: VSphereSession | None = None) -> None:
         self.settings = settings
         self._session = session or VSphereSession(settings)
         self._limiter = anyio.CapacityLimiter(settings.max_concurrency)

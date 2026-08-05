@@ -8,10 +8,10 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pyVmomi import vim
 
-from ..errors import InvalidArgumentError
-from ..vsphere import lookup, mappers, monitoring, perf
-from ..vsphere.tasks import read_task_info
-from ._common import ToolContext, mcp_tool, paginate
+from ...errors import InvalidArgumentError
+from ...vsphere import lookup, mappers, monitoring, perf
+from ...vsphere.tasks import read_task_info
+from .._common import ToolContext, mcp_tool, paginate
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True)
 
