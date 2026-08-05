@@ -60,11 +60,17 @@ Working effectively:
 """
 
 
-def create_server(settings: Settings | None = None) -> MCPServer:
-    """Build the MCP server, its tools, resources and prompts."""
+def create_server(
+    settings: Settings | None = None, client: VSphereClient | None = None
+) -> MCPServer:
+    """Build the MCP server, its tools, resources and prompts.
+
+    ``client`` exists so tests can supply a client backed by something other
+    than a live vCenter; production callers pass settings only.
+    """
     resolved = settings or load_settings()
-    client = VSphereClient(resolved)
-    context = ToolContext(client=client, settings=resolved)
+    vsphere = client or VSphereClient(resolved)
+    context = ToolContext(client=vsphere, settings=resolved)
 
     server = MCPServer(
         name=SERVER_NAME,

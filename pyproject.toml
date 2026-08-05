@@ -60,7 +60,7 @@ target-version = "py310"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF", "BLE"]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF", "BLE", "N", "A"]
 # B008: FastMCP-style defaults are evaluated once at registration on purpose.
 # RUF005: concatenating property-name tuples reads better than unpacking here.
 ignore = ["B008", "RUF005"]

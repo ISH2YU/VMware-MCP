@@ -14,7 +14,7 @@ from typing import Any, Protocol
 import anyio
 from pyVmomi import vim
 
-from ..errors import TaskFailedError, TaskTimeoutError
+from ..errors import TaskFailedError, TaskTimeoutError, VMwareMCPError
 from .mappers import map_task_info
 from .query import moid_of
 
@@ -34,7 +34,13 @@ class ProgressReporter(Protocol):
 
 
 def task_id(task: Any) -> str:
-    return moid_of(task) or ""
+    moid = moid_of(task)
+    if not moid:
+        raise VMwareMCPError(
+            "vSphere accepted the request but returned no task reference, so its progress "
+            "cannot be tracked. Check the recent tasks in vCenter before retrying."
+        )
+    return moid
 
 
 def read_task_info(service_instance: vim.ServiceInstance, moid: str) -> Any:

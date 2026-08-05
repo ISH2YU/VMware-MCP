@@ -22,7 +22,7 @@ def register(server: MCPServer, context: ToolContext) -> None:
     async def vsphere_list_datastores(
         name: str | None = None,
         datacenter: str | None = None,
-        type: str | None = None,
+        datastore_type: str | None = None,
         min_used_percent: float | None = None,
         limit: int | None = None,
         offset: int = 0,
@@ -36,7 +36,8 @@ def register(server: MCPServer, context: ToolContext) -> None:
         Args:
             name: Datastore name filter (substring, or glob with ``*``/``?``).
             datacenter: Only datastores in this datacenter.
-            type: Filter by datastore type such as ``VMFS``, ``NFS`` or ``vsan``.
+            datastore_type: Filter by storage type such as ``VMFS``, ``NFS`` or
+                ``vsan``.
             min_used_percent: Only datastores at or above this utilisation, for
                 spotting the ones about to fill up.
             limit: Maximum number of datastores to return.
@@ -50,7 +51,10 @@ def register(server: MCPServer, context: ToolContext) -> None:
             for datastore in datastores
             if name_matches(datastore["name"], name)
             and (datacenter is None or datastore["datacenter"] == datacenter)
-            and (type is None or (datastore["type"] or "").lower() == type.lower())
+            and (
+                datastore_type is None
+                or (datastore["type"] or "").lower() == datastore_type.lower()
+            )
             and (min_used_percent is None or (datastore["used_percent"] or 0) >= min_used_percent)
         ]
         page, meta = paginate(
