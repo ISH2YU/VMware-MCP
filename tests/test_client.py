@@ -489,6 +489,32 @@ async def test_clone_concurrency_never_exceeds_the_global_cap(vm_root: Path, fak
     assert fake.max_in_flight <= 2
 
 
+async def test_clone_many_rejects_a_running_source_once(
+    client: WorkstationClient, fake: FakeVmrun, golden: str, vm_root: Path
+):
+    """One clear error, not the same failure repeated for every clone in the batch."""
+    fake.running.add(golden)
+    with pytest.raises(InvalidArgumentError, match="none of these clones"):
+        await client.clone_many(
+            "win11-golden", 5, name_prefix="lab", destination_dir=str(vm_root / "lab")
+        )
+    assert not fake.methods("clone")
+
+
+async def test_clone_many_from_a_snapshot_works_while_the_source_runs(
+    client: WorkstationClient, fake: FakeVmrun, golden: str, vm_root: Path
+):
+    fake.running.add(golden)
+    result = await client.clone_many(
+        "win11-golden",
+        2,
+        name_prefix="lab",
+        destination_dir=str(vm_root / "lab"),
+        snapshot="golden",
+    )
+    assert result["created"] == 2
+
+
 async def test_clone_many_validates_its_inputs(client: WorkstationClient):
     with pytest.raises(InvalidArgumentError, match="at least 1"):
         await client.clone_many("win11-golden", 0, name_prefix="x")

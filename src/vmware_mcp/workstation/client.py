@@ -394,6 +394,15 @@ class WorkstationClient:
 
         source = await self.inventory.resolve_async(identifier)
         prefix = validate_vm_name(name_prefix, field="name_prefix")
+        # Check the source once here rather than letting every clone in the batch
+        # rediscover the same problem.
+        self._require_pro_feature("cloning")
+        if snapshot is None and await self._is_running(source):
+            raise InvalidArgumentError(
+                f"{source.name!r} is powered on, so none of these clones can be made. "
+                f"Stop it first, or pass snapshot=... naming a snapshot taken while it "
+                f"was powered off."
+            )
         parent_dir = Path(destination_dir).expanduser() if destination_dir else None
         width = max(2, len(str(count)))
 
