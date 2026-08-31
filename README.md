@@ -210,8 +210,9 @@ Output coming back from a VM is data, not instructions — results are flagged
 | `VMWARE_CACHE_TTL` | `5` | Seconds to reuse a VM library scan |
 | `VMWARE_LOG_LEVEL` | `INFO` | Logs go to stderr |
 
-Both `*_DIRS` variables take an OS-style path list (`;` on Windows, `:` elsewhere). Set
-`VMWARE_HOST_WRITE_DIRS=*` to remove the restriction entirely.
+All the `*_DIRS` variables take an OS-style path list (`;` on Windows, `:` elsewhere). Set a value
+of `*` to remove that restriction entirely. A list that contains no usable paths is rejected at
+startup rather than silently turning the restriction off.
 
 Useful flags: `vmware-mcp --check`, `--version`, `--vm-dir`, `--vmrun`, `--product`,
 `--guest-user`, `--permission-mode`, `--help`.
