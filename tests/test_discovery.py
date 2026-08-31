@@ -56,6 +56,55 @@ def test_a_symlink_cycle_does_not_hang(tmp_path: Path):
     assert [path.stem for path in found] == ["real"]
 
 
+def test_a_symlinked_vmx_pointing_outside_is_not_registered(tmp_path: Path):
+    """A link inside the library must not smuggle in a VM that lives elsewhere."""
+    library = tmp_path / "library"
+    elsewhere = tmp_path / "elsewhere"
+    library.mkdir()
+    real = write_vmx(elsewhere, "smuggled")
+    try:
+        (library / "smuggled.vmx").symlink_to(real)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not supported here")
+    assert discover_vmx_files((library,)) == []
+
+
+def test_a_symlinked_directory_pointing_outside_is_not_registered(tmp_path: Path):
+    library = tmp_path / "library"
+    elsewhere = tmp_path / "elsewhere"
+    library.mkdir()
+    write_vmx(elsewhere, "smuggled")
+    try:
+        (library / "link").symlink_to(elsewhere, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not supported here")
+    assert discover_vmx_files((library,)) == []
+
+
+def test_a_symlinked_vmx_inside_the_library_is_fine(tmp_path: Path):
+    library = tmp_path / "library"
+    real = write_vmx(library, "genuine")
+    try:
+        (library / "alias.vmx").symlink_to(real)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not supported here")
+    # The alias resolves to the real file, which is inside the library, so it is
+    # kept exactly once.
+    assert [path.stem for path in discover_vmx_files((library,))] == ["genuine"]
+
+
+def test_a_second_configured_root_is_still_allowed(tmp_path: Path):
+    first = tmp_path / "one"
+    second = tmp_path / "two"
+    first.mkdir()
+    real = write_vmx(second, "shared")
+    try:
+        (first / "shared.vmx").symlink_to(real)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not supported here")
+    assert [path.stem for path in discover_vmx_files((first, second))] == ["shared"]
+
+
 def test_the_same_vm_reached_twice_appears_once(tmp_path: Path, vm_root: Path):
     found = discover_vmx_files((vm_root, vm_root, vm_root.parent / "library"))
     assert len(found) == 3

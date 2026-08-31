@@ -15,7 +15,7 @@ import anyio
 import anyio.to_thread
 
 from ..errors import AmbiguousObjectError, ObjectNotFoundError
-from .paths import normalize_path, require_within_vm_dirs
+from .paths import normalize_path, path_is_within_any, require_within_vm_dirs
 from .vmx import VmxFile, guest_os_family, load_vmx
 
 logger = logging.getLogger(__name__)
@@ -81,21 +81,27 @@ def discover_vmx_files(
     has already entered, so a symlink pointing at an ancestor cannot spin
     forever and a mis-pointed ``VMWARE_VM_DIRS`` at ``/`` cannot hang the
     process.
+
+    Every hit is checked against the resolved roots before it is returned: a
+    symlink sitting in the library but pointing at a ``.vmx`` somewhere else is
+    not a VM this server is allowed to touch.
     """
     found: list[Path] = []
     seen_files: set[str] = set()
     visited_dirs: set[str] = set()
 
+    roots: list[Path] = []
     for directory in directories:
-        root = directory.expanduser()
         try:
-            root = root.resolve()
+            resolved_root = directory.expanduser().resolve()
         except OSError:
             continue
-        if not root.is_dir():
-            logger.debug("VM directory does not exist, skipping: %s", root)
-            continue
+        if resolved_root.is_dir():
+            roots.append(resolved_root)
+        else:
+            logger.debug("VM directory does not exist, skipping: %s", resolved_root)
 
+    for root in roots:
         queue: deque[tuple[Path, int]] = deque([(root, max_depth)])
         while queue:
             current, depth = queue.popleft()
@@ -124,6 +130,12 @@ def discover_vmx_files(
                     try:
                         resolved = entry.resolve()
                     except OSError:
+                        continue
+                    if not path_is_within_any(resolved, roots):
+                        logger.warning(
+                            "Ignoring %s: it points outside the configured VM directories.",
+                            entry,
+                        )
                         continue
                     marker = normalize_path(resolved)
                     if marker in seen_files:
