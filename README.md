@@ -214,6 +214,10 @@ All the `*_DIRS` variables take an OS-style path list (`;` on Windows, `:` elsew
 of `*` to remove that restriction entirely. A list that contains no usable paths is rejected at
 startup rather than silently turning the restriction off.
 
+These older names are still accepted as aliases: `VMWARE_VM_DIR` for `VMWARE_VM_DIRS`,
+`VMWARE_VMRUN` for `VMWARE_VMRUN_PATH`, `VMWARE_HOST_TYPE` for `VMWARE_PRODUCT`, and
+`VMWARE_GUEST_USER` for `VMWARE_GUEST_USERNAME`.
+
 Useful flags: `vmware-mcp --check`, `--version`, `--vm-dir`, `--vmrun`, `--product`,
 `--guest-user`, `--permission-mode`, `--help`.
 
