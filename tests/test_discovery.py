@@ -201,6 +201,39 @@ async def test_async_refresh_matches_sync(vm_root: Path):
     assert resolved.guest_os_family == "linux"
 
 
+async def test_invalidating_during_a_scan_does_not_publish_stale_data(vm_root: Path):
+    """A delete that lands mid-scan must not be papered over for a whole TTL."""
+    inventory = VmInventory((vm_root,), ttl=300)
+    real_scan = inventory._scan
+    calls = {"count": 0}
+
+    def scan_then_change():
+        calls["count"] += 1
+        result = real_scan()
+        if calls["count"] == 1:
+            # Simulate another task deleting a VM while this scan was running.
+            inventory.invalidate()
+        return result
+
+    inventory._scan = scan_then_change
+    await inventory.refresh_async()
+    assert calls["count"] == 2, "the scan should have been repeated after the change"
+
+
+async def test_a_library_that_keeps_changing_is_not_cached_as_fresh(vm_root: Path):
+    inventory = VmInventory((vm_root,), ttl=300)
+    real_scan = inventory._scan
+
+    def always_changing():
+        result = real_scan()
+        inventory.invalidate()
+        return result
+
+    inventory._scan = always_changing
+    await inventory.refresh_async()
+    assert not inventory._is_fresh(), "a contested scan must not be trusted"
+
+
 def test_an_empty_library_still_caches(tmp_path: Path):
     inventory = VmInventory((tmp_path,), ttl=300)
     assert inventory.list() == []

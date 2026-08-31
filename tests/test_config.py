@@ -64,6 +64,13 @@ def test_blank_entries_in_a_directory_list_are_dropped(tmp_path: Path):
     assert load_settings({"VMWARE_VM_DIRS": raw}).vm_dirs == (tmp_path,)
 
 
+@pytest.mark.parametrize("raw", [os.pathsep, os.pathsep * 3, f" {os.pathsep} "])
+def test_a_directory_list_with_no_real_paths_is_rejected(raw):
+    """Falling back to defaults here would quietly switch the VM sandbox off."""
+    with pytest.raises(ConfigurationError, match="no usable paths"):
+        load_settings({"VMWARE_VM_DIRS": raw})
+
+
 def test_home_is_expanded():
     settings = load_settings({"VMWARE_VM_DIRS": "~/vms"})
     assert settings.vm_dirs == (Path.home() / "vms",)

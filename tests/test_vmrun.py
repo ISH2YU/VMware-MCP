@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -149,36 +150,59 @@ async def test_check_false_returns_the_failure(tmp_path: Path):
     assert result.failed
 
 
-async def test_concurrency_is_capped(tmp_path: Path):
-    """Each fake vmrun adds a byte to a file while it runs; the peak is the concurrency."""
-    marker = tmp_path / "concurrent"
-    trimmer = "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.write_text(p.read_text()[:-1])"
-    script = tmp_path / "counting"
-    script.write_text(
-        f'#!/bin/sh\nprintf x >> "{marker}"\nsleep 0.2\npython3 -c "{trimmer}" "{marker}"\n'
-    )
-    script.chmod(0o755)
-    marker.write_text("")
-    settings = Settings(vm_dirs=(tmp_path,), max_concurrency=2)
-    runner = VmrunRunner(settings)
-    runner._executable = script
+class _CountingProcess:
+    """Stands in for a running subprocess so concurrency can be measured exactly."""
 
+    def __init__(self) -> None:
+        self.in_flight = 0
+        self.peak = 0
+
+    async def __call__(self, *_args, **_kwargs):
+        import anyio
+
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            await anyio.sleep(0.05)
+        finally:
+            self.in_flight -= 1
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+
+@pytest.mark.parametrize("cap", [1, 2, 4])
+async def test_concurrency_is_capped(tmp_path: Path, monkeypatch, cap: int):
     import anyio
 
-    peak = 0
-
-    async def watch() -> None:
-        nonlocal peak
-        for _ in range(30):
-            peak = max(peak, len(marker.read_text()))
-            await anyio.sleep(0.02)
+    counter = _CountingProcess()
+    monkeypatch.setattr("vmware_mcp.workstation.vmrun.anyio.run_process", counter)
+    runner = VmrunRunner(Settings(vm_dirs=(tmp_path,), max_concurrency=cap))
+    runner._executable = tmp_path / "vmrun"
 
     async with anyio.create_task_group() as group:
-        group.start_soon(watch)
-        for _ in range(6):
+        for _ in range(8):
             group.start_soon(runner.run, "list")
 
-    assert peak <= 2, f"expected at most 2 concurrent vmrun processes, saw {peak}"
+    assert counter.peak == cap, f"expected exactly {cap} concurrent vmrun calls"
+
+
+async def test_every_call_still_completes_under_the_cap(tmp_path: Path, monkeypatch):
+    import anyio
+
+    counter = _CountingProcess()
+    monkeypatch.setattr("vmware_mcp.workstation.vmrun.anyio.run_process", counter)
+    runner = VmrunRunner(Settings(vm_dirs=(tmp_path,), max_concurrency=2))
+    runner._executable = tmp_path / "vmrun"
+    results = []
+
+    async def record() -> None:
+        results.append(await runner.run("list"))
+
+    async with anyio.create_task_group() as group:
+        for _ in range(6):
+            group.start_soon(record)
+
+    assert len(results) == 6
+    assert counter.in_flight == 0
 
 
 def test_version_banner_is_extracted(tmp_path: Path):

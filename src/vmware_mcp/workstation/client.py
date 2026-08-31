@@ -152,7 +152,9 @@ class WorkstationClient:
             if not line.lower().endswith(".vmx"):
                 continue
             # Only advertise VMs the operator exposed through VMWARE_VM_DIRS.
-            if self.settings.vm_dirs and not path_is_within_any(line, self.settings.vm_dirs):
+            # With no directories configured this reports nothing, which is the
+            # safe direction: the sandbox fails closed, never open.
+            if not path_is_within_any(line, self.settings.vm_dirs):
                 continue
             paths.append(line)
         return paths
@@ -289,12 +291,17 @@ class WorkstationClient:
             raise InvalidArgumentError("clone_type must be 'linked' or 'full'.")
         snap = validate_snapshot_name(snapshot) if snapshot else None
 
+        if not self.settings.vm_dirs:
+            raise InvalidArgumentError(
+                "No VM directories are configured, so there is nowhere safe to put a "
+                "clone. Set VMWARE_VM_DIRS."
+            )
         target_dir = (
             Path(destination_dir).expanduser().resolve()
             if destination_dir
             else self._default_clone_dir(source, clone_name)
         )
-        if self.settings.vm_dirs and not path_is_within_any(target_dir, self.settings.vm_dirs):
+        if not path_is_within_any(target_dir, self.settings.vm_dirs):
             listed = ", ".join(str(path) for path in self.settings.vm_dirs)
             raise InvalidArgumentError(
                 f"Clone destination {target_dir} is outside the configured VM directories "
@@ -630,9 +637,7 @@ class WorkstationClient:
     def _default_clone_dir(self, source: DiscoveredVm, clone_name: str) -> Path:
         """Sibling of the source VM if that stays inside the library, else first VM dir."""
         sibling = source.path.parent.parent / clone_name
-        if self.settings.vm_dirs and path_is_within_any(sibling, self.settings.vm_dirs):
-            return sibling
-        if not self.settings.vm_dirs:
+        if path_is_within_any(sibling, self.settings.vm_dirs):
             return sibling
         return Path(self.settings.vm_dirs[0]).expanduser().resolve() / clone_name
 

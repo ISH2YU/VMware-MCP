@@ -162,12 +162,18 @@ class VmInventory:
     instead of each launching their own.
     """
 
+    #: How many times a scan may be restarted because the library changed under it.
+    MAX_RESCANS = 3
+
     def __init__(self, directories: Sequence[Path], *, ttl: float = 5.0) -> None:
         self._directories = tuple(directories)
         self._ttl = ttl
         self._vms: VmList = []
         self._fetched_at: float | None = None
         self._lock = anyio.Lock()
+        # Bumped by invalidate(). A scan that started before the bump must not
+        # publish its result as fresh, or a deleted VM reappears for a full TTL.
+        self._generation = 0
 
     @property
     def directories(self) -> tuple[Path, ...]:
@@ -185,13 +191,21 @@ class VmInventory:
                 logger.warning("Skipping unreadable .vmx at %s", path, exc_info=True)
         return discovered
 
+    def _publish(self, vms: VmList, generation: int) -> VmList:
+        """Store a scan result, marking it fresh only if nothing changed meanwhile."""
+        self._vms = vms
+        if generation == self._generation:
+            self._fetched_at = time.monotonic()
+        else:
+            self._fetched_at = None
+        return list(vms)
+
     def refresh(self, *, force: bool = False) -> VmList:
         """Synchronous refresh, used from non-async call sites and tests."""
         if not force and self._is_fresh():
             return list(self._vms)
-        self._vms = self._scan()
-        self._fetched_at = time.monotonic()
-        return list(self._vms)
+        generation = self._generation
+        return self._publish(self._scan(), generation)
 
     async def refresh_async(self, *, force: bool = False) -> VmList:
         """Refresh off the event loop, collapsing concurrent callers into one scan."""
@@ -200,13 +214,21 @@ class VmInventory:
         async with self._lock:
             if not force and self._is_fresh():
                 return list(self._vms)
-            self._vms = await anyio.to_thread.run_sync(self._scan)
-            self._fetched_at = time.monotonic()
-            return list(self._vms)
+            for _ in range(self.MAX_RESCANS):
+                generation = self._generation
+                vms = await anyio.to_thread.run_sync(self._scan)
+                if generation == self._generation:
+                    return self._publish(vms, generation)
+                # Something changed the library while we were reading it.
+                logger.debug("VM library changed during the scan; reading it again.")
+            # Give up retrying but do not mark the result fresh, so the next
+            # caller rescans rather than trusting a possibly stale list.
+            return self._publish(vms, generation - 1)
 
     def invalidate(self) -> None:
         """Drop the cache so the next lookup rescans."""
         self._fetched_at = None
+        self._generation += 1
 
     def list(self) -> VmList:
         return self.refresh()

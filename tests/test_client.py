@@ -97,6 +97,39 @@ async def test_find_vms_returns_sorted_matches(client: WorkstationClient):
     assert [vm.name for vm in await client.find_vms("win*")] == ["win10-legacy", "win11-golden"]
 
 
+async def test_the_sandbox_fails_closed_without_configured_directories(
+    fake: FakeVmrun, golden: str
+):
+    """With no VM library configured nothing is visible, rather than everything."""
+    from vmware_mcp.config import PermissionMode, Product, Settings
+
+    settings = Settings(
+        vm_dirs=(),
+        product=Product.WORKSTATION,
+        permission_mode=PermissionMode.DESTRUCTIVE,
+    )
+    client = WorkstationClient(settings, runner=fake)  # type: ignore[arg-type]
+    fake.running.add(golden)
+    fake.running.add("/anywhere/else/private.vmx")
+    assert await client.list_running() == []
+    assert await client.list_vms() == []
+
+
+async def test_cloning_without_configured_directories_is_refused(fake: FakeVmrun, vm_root: Path):
+    from vmware_mcp.config import PermissionMode, Product, Settings
+
+    inner = make_client(vm_root, fake)
+    source = await inner.resolve_async("win11-golden")
+    settings = Settings(
+        vm_dirs=(), product=Product.WORKSTATION, permission_mode=PermissionMode.DESTRUCTIVE
+    )
+    client = WorkstationClient(settings, runner=fake)  # type: ignore[arg-type]
+    with pytest.raises(InvalidArgumentError, match="No VM directories are configured"):
+        await client._clone_resolved(
+            source, "orphan", destination_dir=None, clone_type="linked", snapshot=None
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Power
 # --------------------------------------------------------------------------- #

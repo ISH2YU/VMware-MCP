@@ -269,10 +269,21 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     permission_raw = reader.text("PERMISSION_MODE")
     max_results = reader.number("MAX_RESULTS", 500, 1)
 
+    if dirs_raw:
+        vm_dirs = _split_paths(dirs_raw)
+        if not vm_dirs:
+            # Silently falling back would turn the VM sandbox off, so refuse.
+            raise ConfigurationError(
+                f"{ENV_PREFIX}VM_DIRS is set to {dirs_raw!r}, which contains no usable "
+                f"paths. Separate directories with {os.pathsep!r}."
+            )
+    else:
+        vm_dirs = default_vm_directories()
+
     return Settings(
         vmrun_path=str(Path(vmrun_path).expanduser()) if vmrun_path else None,
         product=Product.parse(product_raw) if product_raw else Product.detect(),
-        vm_dirs=_split_paths(dirs_raw) if dirs_raw else default_vm_directories(),
+        vm_dirs=vm_dirs,
         guest_username=reader.text("GUEST_USERNAME", "VMWARE_GUEST_USER"),
         guest_password=reader.raw("GUEST_PASSWORD"),
         guest_temp_dir=reader.text("GUEST_TEMP_DIR"),
