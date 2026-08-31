@@ -58,7 +58,15 @@ class VmxFile:
         return "\n".join(lines) + "\n"
 
     def write(self) -> None:
-        self.path.write_text(self.as_text(), encoding=self.encoding)
+        """Atomically replace the ``.vmx`` so a crash cannot leave a half-written file."""
+        data = self.as_text()
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        try:
+            tmp.write_text(data, encoding=self.encoding)
+            tmp.replace(self.path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
 
     def summary(self) -> dict[str, Any]:
         """The fields an operator usually cares about."""
@@ -170,8 +178,12 @@ def apply_config_changes(
     """
     if cpu_count is not None and cpu_count < 1:
         raise InvalidArgumentError("cpu_count must be at least 1.")
+    if cpu_count is not None and cpu_count > 256:
+        raise InvalidArgumentError("cpu_count must be at most 256.")
     if memory_mb is not None and memory_mb < 4:
         raise InvalidArgumentError("memory_mb must be at least 4.")
+    if memory_mb is not None and memory_mb > 1_048_576:
+        raise InvalidArgumentError("memory_mb must be at most 1048576 (1 TiB).")
     if cores_per_socket is not None:
         if cores_per_socket < 1:
             raise InvalidArgumentError("cores_per_socket must be at least 1.")

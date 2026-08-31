@@ -29,21 +29,22 @@ def register(server: MCPServer, context: ToolContext) -> None:
         Call this after powering on a Windows test VM before running commands
         inside it. Without Tools ready, every guest operation fails.
 
+        ``timeout_seconds`` is a single deadline covering both Tools and IP, not
+        two waits stacked back to back.
+
         Args:
             vm: Display name, ``.vmx`` path, directory name or BIOS UUID.
             wait_for_ip: Also wait for a guest IP address.
-            timeout_seconds: Override the default boot timeout.
+            timeout_seconds: Override the default boot timeout for the whole wait.
         """
         resolved = client.resolve(vm)
-        tools = await client.guest.wait_for_tools(resolved.path, timeout=timeout_seconds)
-        ip = None
-        if wait_for_ip:
-            ip = await client.guest.wait_for_ip(resolved.path, timeout=timeout_seconds)
+        ready = await client.guest.wait_for_guest(
+            resolved.path, wait_for_ip=wait_for_ip, timeout=timeout_seconds
+        )
         return {
             "vm": resolved.name,
             "path": str(resolved.path),
-            "tools_state": tools,
-            "ip_address": ip,
+            **ready,
         }
 
     @mcp_tool(server, annotations=MUTATING)

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import shlex
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -83,7 +85,7 @@ class GuestOps:
     async def wait_for_tools(
         self, vmx: Path, *, timeout: float | None = None, poll_seconds: float = 2.0
     ) -> str:
-        limit = self._settings.boot_timeout if timeout is None else timeout
+        limit = _positive_timeout(timeout, self._settings.boot_timeout)
         with anyio.move_on_after(limit) as scope:
             while True:
                 state = await self.tools_state(vmx)
@@ -109,7 +111,7 @@ class GuestOps:
     async def wait_for_ip(
         self, vmx: Path, *, timeout: float | None = None, poll_seconds: float = 2.0
     ) -> str:
-        limit = self._settings.boot_timeout if timeout is None else timeout
+        limit = _positive_timeout(timeout, self._settings.boot_timeout)
         with anyio.move_on_after(limit) as scope:
             # Prefer the blocking form; fall back to polling if the host's vmrun
             # is too old to support -wait.
@@ -130,6 +132,28 @@ class GuestOps:
             )
         raise AssertionError("unreachable")  # pragma: no cover
 
+    async def wait_for_guest(
+        self,
+        vmx: Path,
+        *,
+        wait_for_ip: bool = True,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Wait for Tools, then optionally an IP, under a single deadline."""
+        limit = _positive_timeout(timeout, self._settings.boot_timeout)
+        deadline = anyio.current_time() + limit
+        tools = await self.wait_for_tools(vmx, timeout=limit)
+        ip: str | None = None
+        if wait_for_ip:
+            remaining = deadline - anyio.current_time()
+            if remaining <= 0:
+                raise GuestOperationError(
+                    f"VMware Tools became ready but the {limit:g}s wait expired before "
+                    f"an IP was available for {vmx.name}."
+                )
+            ip = await self.wait_for_ip(vmx, timeout=remaining)
+        return {"tools_state": tools, "ip_address": ip}
+
     async def run_program(
         self,
         vmx: Path,
@@ -148,6 +172,8 @@ class GuestOps:
         we wrap the command so the guest writes stdout/stderr to temp files,
         then pull those files back. ``no_wait`` skips capture entirely.
         """
+        if not program or not program.strip():
+            raise InvalidArgumentError("program must not be empty.")
         if no_wait:
             args = [str(vmx), "-noWait"]
             if interactive:
@@ -277,35 +303,38 @@ class GuestOps:
         interactive: bool,
         timeout: float | None,
     ) -> GuestCommandResult:
-        out_remote = r"C:\Windows\Temp\vmware-mcp-out.txt"
-        err_remote = r"C:\Windows\Temp\vmware-mcp-err.txt"
-        code_remote = r"C:\Windows\Temp\vmware-mcp-code.txt"
-        # cmd.exe /C runs the program and captures streams; exit code is written last.
-        cmdline = (
-            f'/C ""{program}" {arguments} > "{out_remote}" 2> "{err_remote}" '
-            f'& echo %ERRORLEVEL% > "{code_remote}""'
-            if arguments
-            else f'/C ""{program}" > "{out_remote}" 2> "{err_remote}" '
-            f'& echo %ERRORLEVEL% > "{code_remote}""'
-        )
-        args = [str(vmx)]
+        token = uuid.uuid4().hex[:8]
+        out_remote = rf"C:\Windows\Temp\vmware-mcp-{token}-out.txt"
+        err_remote = rf"C:\Windows\Temp\vmware-mcp-{token}-err.txt"
+        code_remote = rf"C:\Windows\Temp\vmware-mcp-{token}-code.txt"
+        script_remote = rf"C:\Windows\Temp\vmware-mcp-{token}-run.ps1"
+        script = _windows_capture_script(program, arguments, out_remote, err_remote, code_remote)
+        await self._write_text(vmx, script_remote, script, auth=auth)
+        guest_args = [str(vmx)]
         if interactive:
-            args.append("-interactive")
-        args += ["cmd.exe", cmdline]
+            guest_args.append("-interactive")
+        guest_args += [
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script_remote,
+        ]
         await self._runner.run(
             "runProgramInGuest",
-            *args,
+            *guest_args,
             auth=auth,
             timeout=timeout or self._settings.guest_timeout,
         )
         stdout, stdout_trunc = await self._read_guest_text(vmx, out_remote, auth=auth)
         stderr, stderr_trunc = await self._read_guest_text(vmx, err_remote, auth=auth)
         code_text, _ = await self._read_guest_text(vmx, code_remote, auth=auth)
-        exit_code = _parse_exit_code(code_text)
         return GuestCommandResult(
             program=program,
             arguments=arguments,
-            exit_code=exit_code,
+            exit_code=_parse_exit_code(code_text),
             stdout=stdout,
             stderr=stderr,
             truncated=stdout_trunc or stderr_trunc,
@@ -321,21 +350,20 @@ class GuestOps:
         interactive: bool,
         timeout: float | None,
     ) -> GuestCommandResult:
-        out_remote = "/tmp/vmware-mcp-out.txt"
-        err_remote = "/tmp/vmware-mcp-err.txt"
-        code_remote = "/tmp/vmware-mcp-code.txt"
-        script = (
-            f'"{program}" {arguments} > "{out_remote}" 2> "{err_remote}"; echo $? > "{code_remote}"'
-            if arguments
-            else f'"{program}" > "{out_remote}" 2> "{err_remote}"; echo $? > "{code_remote}"'
-        )
-        args = [str(vmx)]
+        token = uuid.uuid4().hex[:8]
+        out_remote = f"/tmp/vmware-mcp-{token}-out.txt"
+        err_remote = f"/tmp/vmware-mcp-{token}-err.txt"
+        code_remote = f"/tmp/vmware-mcp-{token}-code.txt"
+        script_remote = f"/tmp/vmware-mcp-{token}-run.sh"
+        script = _posix_capture_script(program, arguments, out_remote, err_remote, code_remote)
+        await self._write_text(vmx, script_remote, script, auth=auth)
+        guest_args = [str(vmx)]
         if interactive:
-            args.append("-interactive")
-        args += ["/bin/sh", "-c", script]
+            guest_args.append("-interactive")
+        guest_args += ["/bin/sh", script_remote]
         await self._runner.run(
             "runProgramInGuest",
-            *args,
+            *guest_args,
             auth=auth,
             timeout=timeout or self._settings.guest_timeout,
         )
@@ -387,6 +415,58 @@ class GuestOps:
                 auth=auth,
                 timeout=60,
             )
+
+
+def _positive_timeout(timeout: float | None, default: float) -> float:
+    limit = default if timeout is None else float(timeout)
+    if limit <= 0:
+        raise InvalidArgumentError("timeout must be greater than 0 seconds.")
+    return limit
+
+
+def _ps_quote(value: str) -> str:
+    """Single-quoted PowerShell literal; the only escape is doubling ``'``."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _windows_capture_script(
+    program: str, arguments: str, out_remote: str, err_remote: str, code_remote: str
+) -> str:
+    """Run ``program`` via ProcessStartInfo so cmd metacharacters are not interpreted."""
+    return (
+        "$ErrorActionPreference = 'Continue'\n"
+        "$psi = New-Object System.Diagnostics.ProcessStartInfo\n"
+        f"$psi.FileName = {_ps_quote(program)}\n"
+        f"$psi.Arguments = {_ps_quote(arguments)}\n"
+        "$psi.UseShellExecute = $false\n"
+        "$psi.RedirectStandardOutput = $true\n"
+        "$psi.RedirectStandardError = $true\n"
+        "$psi.CreateNoWindow = $true\n"
+        "$proc = New-Object System.Diagnostics.Process\n"
+        "$proc.StartInfo = $psi\n"
+        "[void]$proc.Start()\n"
+        "$stdout = $proc.StandardOutput.ReadToEnd()\n"
+        "$stderr = $proc.StandardError.ReadToEnd()\n"
+        "$proc.WaitForExit()\n"
+        f"[System.IO.File]::WriteAllText({_ps_quote(out_remote)}, $stdout)\n"
+        f"[System.IO.File]::WriteAllText({_ps_quote(err_remote)}, $stderr)\n"
+        f"[System.IO.File]::WriteAllText({_ps_quote(code_remote)}, [string]$proc.ExitCode)\n"
+    )
+
+
+def _posix_capture_script(
+    program: str, arguments: str, out_remote: str, err_remote: str, code_remote: str
+) -> str:
+    """Quote program and each argument so the wrapper shell cannot be hijacked."""
+    try:
+        tokens = shlex.split(arguments, posix=True) if arguments.strip() else []
+    except ValueError as exc:
+        raise InvalidArgumentError(f"Could not parse arguments: {exc}") from exc
+    cmd = " ".join([shlex.quote(program), *(shlex.quote(token) for token in tokens)])
+    return (
+        f"{cmd} > {shlex.quote(out_remote)} 2> {shlex.quote(err_remote)}\n"
+        f"echo $? > {shlex.quote(code_remote)}\n"
+    )
 
 
 def _parse_exit_code(text: str) -> int | None:

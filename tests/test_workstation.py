@@ -113,6 +113,8 @@ def test_apply_config_changes_validates(vm_root: Path):
         apply_config_changes(vmx, memory_mb=1)
     with pytest.raises(InvalidArgumentError):
         apply_config_changes(vmx, cpu_count=6, cores_per_socket=4)
+    with pytest.raises(InvalidArgumentError):
+        apply_config_changes(vmx, cpu_count=300)
 
 
 # --------------------------------------------------------------------------- #
@@ -274,6 +276,64 @@ async def test_wait_for_guest(client: WorkstationClient, fake: FakeVmrun, vm_roo
     ip = await client.guest.wait_for_ip(Path(path), timeout=2)
     assert tools == "running"
     assert ip == "10.0.0.5"
+    combined = await client.guest.wait_for_guest(Path(path), wait_for_ip=True, timeout=5)
+    assert combined == {"tools_state": "running", "ip_address": "10.0.0.5"}
+
+
+async def test_wait_for_guest_rejects_non_positive_timeout(
+    client: WorkstationClient, vm_root: Path
+):
+    path = vm_root / "win11-golden" / "win11-golden.vmx"
+    with pytest.raises(InvalidArgumentError, match="greater than 0"):
+        await client.guest.wait_for_guest(path, timeout=0)
+
+
+async def test_resolve_and_clone_stay_inside_vm_dirs(
+    client: WorkstationClient, vm_root: Path, tmp_path: Path
+):
+    outsider = write_vmx(tmp_path.parent / f"vmware-mcp-outside-{tmp_path.name}", "sneaky")
+    with pytest.raises(ObjectNotFoundError, match="outside"):
+        client.resolve(str(outsider))
+    with pytest.raises(InvalidArgumentError, match="outside"):
+        await client.clone_vm(
+            "win11-golden",
+            "escaped",
+            destination_dir=str(tmp_path.parent / f"vmware-mcp-escape-{tmp_path.name}"),
+        )
+
+
+async def test_list_running_hides_vms_outside_the_library(
+    client: WorkstationClient, fake: FakeVmrun, vm_root: Path
+):
+    inside = str(vm_root / "win11-golden" / "win11-golden.vmx")
+    fake.running.add(inside)
+    fake.running.add("/not/in/library/hidden.vmx")
+    listed = await client.list_running()
+    assert inside in listed
+    assert not any("hidden.vmx" in item for item in listed)
+
+
+async def test_posix_run_uploads_a_quoted_wrapper(
+    client: WorkstationClient, fake: FakeVmrun, vm_root: Path
+):
+    path = str(vm_root / "ubuntu-dev" / "ubuntu-dev.vmx")
+    fake.running.add(path)
+    fake.tools_state[path] = "running"
+    result = await client.guest.run_program(
+        Path(path),
+        "/bin/echo",
+        "hello; rm -rf /",
+        auth=client.auth(),
+        guest_os="ubuntu-64",
+    )
+    assert result.exit_code == 0
+    scripts = [
+        data.decode()
+        for name, data in fake.guest_files[path].items()
+        if str(name).endswith("-run.sh")
+    ]
+    assert scripts
+    assert "'hello;'" in scripts[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -341,6 +401,15 @@ async def test_server_advertises_workstation_prompts(server):
     async with Client(server) as session:
         prompts = {prompt.name for prompt in (await session.list_prompts()).prompts}
     assert prompts == {"spin_up_test_vms", "run_windows_test", "reset_test_vms"}
+
+
+async def test_wait_for_guest_tool(server, fake: FakeVmrun, vm_root: Path):
+    path = str(vm_root / "win11-golden" / "win11-golden.vmx")
+    fake.tools_state[path] = "running"
+    fake.ips[path] = "10.0.0.8"
+    result = await call_ok(server, "vmware_wait_for_guest", vm="win11-golden")
+    assert result["tools_state"] == "running"
+    assert result["ip_address"] == "10.0.0.8"
 
 
 async def test_twenty_workstation_tools_are_registered(server):

@@ -6,8 +6,10 @@ import json
 import logging
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ResourceError
 
 from .config import PermissionMode, Settings, load_settings
+from .errors import VMwareMCPError
 from .tools import ToolContext, register_all
 from .workstation import WorkstationClient
 
@@ -81,7 +83,7 @@ def create_server(
     server = MCPServer(
         name=SERVER_NAME,
         title="VMware Workstation",
-        version="0.1.0",
+        version="0.2.0",
         instructions=build_instructions(resolved),
         website_url="https://github.com/ISH2YU/VMware-MCP",
     )
@@ -102,7 +104,10 @@ def _register_resources(server: MCPServer, context: ToolContext) -> None:
         mime_type="application/json",
     )
     async def list_vms_resource() -> str:
-        vms = await client.list_vms()
+        try:
+            vms = await client.list_vms()
+        except VMwareMCPError as exc:
+            raise ResourceError(str(exc)) from exc
         return json.dumps({"count": len(vms), "vms": vms}, indent=2)
 
     @server.resource(
@@ -112,7 +117,10 @@ def _register_resources(server: MCPServer, context: ToolContext) -> None:
         mime_type="application/json",
     )
     async def vm_detail(identifier: str) -> str:
-        return json.dumps(await client.get_vm(identifier), indent=2, default=str)
+        try:
+            return json.dumps(await client.get_vm(identifier), indent=2, default=str)
+        except VMwareMCPError as exc:
+            raise ResourceError(str(exc)) from exc
 
 
 def _register_prompts(server: MCPServer) -> None:

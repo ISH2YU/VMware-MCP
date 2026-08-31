@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import AmbiguousObjectError, ObjectNotFoundError
+from .paths import normalize_path, require_within_vm_dirs
 from .vmx import VmxFile, guest_os_family, load_vmx
 
 logger = logging.getLogger(__name__)
@@ -119,19 +120,29 @@ class VmInventory:
         return self.refresh()
 
     def resolve(self, identifier: str) -> DiscoveredVm:
-        """Find exactly one VM by name, path, stem or UUID."""
+        """Find exactly one VM by name, path, stem or UUID.
+
+        A ``.vmx`` path is accepted only when it sits under one of the configured
+        VM directories. That is the sandbox: tools cannot power, clone or delete
+        machines the operator did not expose via ``VMWARE_VM_DIRS``.
+        """
         needle = identifier.strip()
         if not needle:
             raise ObjectNotFoundError("VM identifier must not be empty.")
         vms = self.refresh()
 
         as_path = Path(needle).expanduser()
-        if as_path.suffix.lower() == ".vmx" or as_path.exists():
+        looks_like_vmx = as_path.suffix.lower() == ".vmx" or (
+            as_path.exists() and as_path.suffix.lower() == ".vmx"
+        )
+        if looks_like_vmx or (as_path.exists() and as_path.is_file()):
             resolved = as_path.resolve()
-            for vm in vms:
-                if vm.path == resolved:
-                    return vm
             if resolved.is_file() and resolved.suffix.lower() == ".vmx":
+                require_within_vm_dirs(resolved, self._directories, what="VM")
+                target = normalize_path(resolved)
+                for vm in vms:
+                    if normalize_path(vm.path) == target:
+                        return vm
                 return DiscoveredVm.from_vmx(load_vmx(resolved))
 
         lowered = needle.lower()

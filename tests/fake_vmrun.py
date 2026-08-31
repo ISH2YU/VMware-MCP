@@ -164,6 +164,8 @@ class FakeVmrun:
             vmx, guest, host = arguments[0], arguments[1], arguments[2]
             data = self.guest_files.get(vmx, {}).get(guest)
             if data is None:
+                data = _synthetic_guest_file(guest)
+            if data is None:
                 return "", "Error: The file was not found", 1
             Path(host).write_bytes(data)
             return "", "", 0
@@ -181,29 +183,37 @@ class FakeVmrun:
         return "", f"Error: unknown command {command}", 1
 
     def _run_program(self, arguments: list[str], auth: Any) -> tuple[str, str, int]:
-        # Strip optional flags then: vmx, program, [args...]
         args = list(arguments)
+        no_wait = False
+        vmx = args.pop(0) if args else ""
         while args and args[0] in {"-noWait", "-interactive", "-activeWindow"}:
+            if args[0] == "-noWait":
+                no_wait = True
             args.pop(0)
-        vmx = args[0]
-        program = args[1] if len(args) > 1 else ""
-        cmdline = args[2] if len(args) > 2 else ""
-
-        # Our guest helpers write output to known temp files in the guest.
+        if no_wait:
+            return "", "", 0
         files = self.guest_files.setdefault(vmx, {})
-        if program in {"cmd.exe", "/bin/sh"} or "cmd.exe" in program:
-            # Simulate a successful command that wrote capture files.
-            if "vmware-mcp-out.txt" in cmdline or "vmware-mcp-out.txt" in str(files):
-                pass
-            # Windows capture paths
-            files[r"C:\Windows\Temp\vmware-mcp-out.txt"] = b"hello from guest\n"
-            files[r"C:\Windows\Temp\vmware-mcp-err.txt"] = b""
-            files[r"C:\Windows\Temp\vmware-mcp-code.txt"] = b"0\n"
-            # Posix capture paths
-            files["/tmp/vmware-mcp-out.txt"] = b"hello from guest\n"
-            files["/tmp/vmware-mcp-err.txt"] = b""
-            files["/tmp/vmware-mcp-code.txt"] = b"0\n"
+        files[r"C:\Windows\Temp\vmware-mcp-out.txt"] = b"hello from guest\n"
+        files[r"C:\Windows\Temp\vmware-mcp-err.txt"] = b""
+        files[r"C:\Windows\Temp\vmware-mcp-code.txt"] = b"0\n"
+        files["/tmp/vmware-mcp-out.txt"] = b"hello from guest\n"
+        files["/tmp/vmware-mcp-err.txt"] = b""
+        files["/tmp/vmware-mcp-code.txt"] = b"0\n"
         return "", "", 0
+
+
+def _synthetic_guest_file(guest_path: str) -> bytes | None:
+    """Stand-in capture files for uniquely named vmware-mcp temp paths."""
+    name = guest_path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if not name.startswith("vmware-mcp-"):
+        return None
+    if name.endswith("-out.txt") or name == "vmware-mcp-out.txt":
+        return b"hello from guest\n"
+    if name.endswith("-err.txt") or name == "vmware-mcp-err.txt":
+        return b""
+    if name.endswith("-code.txt") or name == "vmware-mcp-code.txt":
+        return b"0\n"
+    return None
 
 
 def write_vmx(

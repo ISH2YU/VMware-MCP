@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import fnmatch
+import functools
 import inspect
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from ..config import Settings
-from ..errors import InvalidArgumentError
+from ..errors import InvalidArgumentError, VMwareMCPError
 from ..workstation import WorkstationClient
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -26,11 +28,23 @@ class ToolContext:
 
 
 def mcp_tool(server: MCPServer, **kwargs: Any) -> Callable[[F], F]:
-    """``server.tool`` with the docstring dedented before it reaches the client."""
+    """``server.tool`` with a cleaned docstring and anticipated-error wrapping.
+
+    ``VMwareMCPError`` is raised as MCP ``ToolError`` so the client sees the
+    real message (permission mode, unknown VM, …) instead of a generic crash.
+    """
 
     def decorator(func: F) -> F:
         description = inspect.cleandoc(func.__doc__) if func.__doc__ else None
-        return server.tool(description=description, **kwargs)(func)
+
+        @functools.wraps(func)
+        async def wrapper(*args: Any, **kwds: Any) -> Any:
+            try:
+                return await func(*args, **kwds)
+            except VMwareMCPError as exc:
+                raise ToolError(str(exc)) from exc
+
+        return server.tool(description=description, **kwargs)(wrapper)  # type: ignore[return-value]
 
     return decorator
 

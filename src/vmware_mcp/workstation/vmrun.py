@@ -191,28 +191,24 @@ class VmrunRunner:
         args = self.build_args(command, *arguments, auth=auth)
         limit = self._settings.command_timeout if timeout is None else timeout
         logger.debug("Running: %s", _redact(args))
-
-        with anyio.move_on_after(limit) as scope:
-            completed = await anyio.run_process(args, check=False)
-            result = VmrunResult(
-                args=tuple(args),
-                exit_code=completed.returncode,
-                stdout=completed.stdout.decode("utf-8", "replace"),
-                stderr=completed.stderr.decode("utf-8", "replace"),
-            )
-            if check and result.exit_code != 0:
-                raise VmrunError(
-                    describe_failure(result), command=command, exit_code=result.exit_code
-                )
-            return result
-
-        if scope.cancelled_caught:
+        try:
+            with anyio.fail_after(limit):
+                completed = await anyio.run_process(args, check=False)
+        except TimeoutError:
             raise CommandTimeoutError(
                 f"'vmrun {command}' did not finish within {limit:g}s and was stopped. "
                 f"Long operations such as cloning a large VM may need a higher "
                 f"VMWARE_COMMAND_TIMEOUT."
-            )
-        raise AssertionError("unreachable")  # pragma: no cover
+            ) from None
+        result = VmrunResult(
+            args=tuple(args),
+            exit_code=completed.returncode,
+            stdout=completed.stdout.decode("utf-8", "replace"),
+            stderr=completed.stderr.decode("utf-8", "replace"),
+        )
+        if check and result.exit_code != 0:
+            raise VmrunError(describe_failure(result), command=command, exit_code=result.exit_code)
+        return result
 
     async def version(self) -> str | None:
         """The version banner ``vmrun`` prints when called with no arguments."""

@@ -181,8 +181,16 @@ Useful flags: `vmware-mcp --check`, `--vm-dir`, `--vmrun`, `--product`, `--guest
 - **Linked clones** (`clone_type=linked`) are fast and small. Do not delete or heavily change the
   golden image while linked clones still depend on it.
 - **Guest credentials** should be a local admin on the golden image, not your daily Windows login.
+
+## Safety
+
+- Only VMs under `VMWARE_VM_DIRS` can be listed, powered, cloned or deleted. A
+  `.vmx` path outside those folders is refused, even if the file exists.
+- Clone names cannot contain `..` or path separators; clone folders must also
+  stay inside `VMWARE_VM_DIRS`.
+- Guest commands are run through a quoted wrapper so arguments cannot break out
+  of the capture shell. Use `vmware_run_script` when you actually want a script.
 - Start in `read-only` if you only want the AI to inspect VMs.
-- Passwords never appear in tool output.
 
 ## Development
 

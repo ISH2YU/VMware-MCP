@@ -8,9 +8,15 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ..config import Settings
-from ..errors import InvalidArgumentError
+from ..errors import InvalidArgumentError, VMwareMCPError
 from .discovery import DiscoveredVm, VmInventory, name_matches
 from .guest import GuestAuth, GuestOps
+from .paths import (
+    normalize_path,
+    path_is_within_any,
+    validate_snapshot_name,
+    validate_vm_name,
+)
 from .vmrun import VmrunRunner
 from .vmx import apply_config_changes, load_vmx
 
@@ -76,7 +82,7 @@ class WorkstationClient:
         running_only: bool = False,
         powered_off_only: bool = False,
     ) -> list[dict[str, Any]]:
-        running_paths = {Path(path).resolve() for path in await self.list_running()}
+        running_paths = {normalize_path(path) for path in await self.list_running()}
         results = []
         for vm in self.inventory.list():
             if not name_matches(vm.name, name):
@@ -85,7 +91,7 @@ class WorkstationClient:
                 continue
             if guest_os_family and (vm.guest_os_family or "").lower() != guest_os_family.lower():
                 continue
-            is_running = vm.path in running_paths
+            is_running = normalize_path(vm.path) in running_paths
             if running_only and not is_running:
                 continue
             if powered_off_only and is_running:
@@ -99,8 +105,8 @@ class WorkstationClient:
         vm = self.inventory.resolve(identifier)
         vmx = load_vmx(vm.path)
         detail = vmx.summary()
-        running = {Path(path).resolve() for path in await self.list_running()}
-        detail["power_state"] = "poweredOn" if vm.path in running else "poweredOff"
+        running = {normalize_path(path) for path in await self.list_running()}
+        detail["power_state"] = "poweredOn" if normalize_path(vm.path) in running else "poweredOff"
         detail["tools_state"] = (
             await self.guest.tools_state(vm.path)
             if detail["power_state"] == "poweredOn"
@@ -124,16 +130,20 @@ class WorkstationClient:
         for line in result.lines:
             if line.lower().startswith("total running vms"):
                 continue
-            if line.lower().endswith(".vmx"):
-                paths.append(line)
+            if not line.lower().endswith(".vmx"):
+                continue
+            # Only advertise VMs the operator exposed through VMWARE_VM_DIRS.
+            if not path_is_within_any(line, self.settings.vm_dirs):
+                continue
+            paths.append(line)
         return paths
 
     async def change_power(
         self, identifier: str, action: PowerAction, *, gui: bool = False
     ) -> dict[str, Any]:
         vm = self.inventory.resolve(identifier)
-        running = {Path(path).resolve() for path in await self.list_running()}
-        is_running = vm.path in running
+        running = {normalize_path(path) for path in await self.list_running()}
+        is_running = normalize_path(vm.path) in running
 
         soft_stop = action == "stop"
         soft_reset = action == "reset"
@@ -211,9 +221,7 @@ class WorkstationClient:
 
     async def create_snapshot(self, identifier: str, name: str) -> dict[str, Any]:
         vm = self.inventory.resolve(identifier)
-        snapshot_name = name.strip()
-        if not snapshot_name:
-            raise InvalidArgumentError("name must not be empty.")
+        snapshot_name = validate_snapshot_name(name)
         await self.runner.run("snapshot", str(vm.path), snapshot_name)
         return {
             "vm": vm.name,
@@ -224,9 +232,7 @@ class WorkstationClient:
 
     async def revert_snapshot(self, identifier: str, snapshot: str) -> dict[str, Any]:
         vm = self.inventory.resolve(identifier)
-        snap = snapshot.strip()
-        if not snap:
-            raise InvalidArgumentError("snapshot must not be empty.")
+        snap = validate_snapshot_name(snapshot)
         await self.runner.run("revertToSnapshot", str(vm.path), snap)
         return {"vm": vm.name, "path": str(vm.path), "snapshot": snap, "status": "completed"}
 
@@ -234,9 +240,7 @@ class WorkstationClient:
         self, identifier: str, snapshot: str, *, delete_children: bool = False
     ) -> dict[str, Any]:
         vm = self.inventory.resolve(identifier)
-        snap = snapshot.strip()
-        if not snap:
-            raise InvalidArgumentError("snapshot must not be empty.")
+        snap = validate_snapshot_name(snapshot)
         args = [str(vm.path), snap]
         if delete_children:
             args.append("andDeleteChildren")
@@ -261,22 +265,29 @@ class WorkstationClient:
         snapshot: str | None = None,
     ) -> dict[str, Any]:
         source = self.inventory.resolve(identifier)
-        clone_name = name.strip()
-        if not clone_name:
-            raise InvalidArgumentError("name must not be empty.")
+        clone_name = validate_vm_name(name)
+        if clone_type not in ("full", "linked"):
+            raise InvalidArgumentError("clone_type must be 'linked' or 'full'.")
+        snap = validate_snapshot_name(snapshot) if snapshot else None
 
         if destination_dir:
             target_dir = Path(destination_dir).expanduser().resolve()
         else:
-            target_dir = source.path.parent.parent / clone_name
+            target_dir = self._default_clone_dir(source, clone_name)
+        if not path_is_within_any(target_dir, self.settings.vm_dirs):
+            listed = ", ".join(str(path) for path in self.settings.vm_dirs)
+            raise InvalidArgumentError(
+                f"Clone destination {target_dir} is outside the configured VM directories "
+                f"({listed}). Put clones under VMWARE_VM_DIRS."
+            )
         target_dir.mkdir(parents=True, exist_ok=True)
         target_vmx = target_dir / f"{clone_name}.vmx"
         if target_vmx.exists():
             raise InvalidArgumentError(f"A VM already exists at {target_vmx}.")
 
         args = [str(source.path), str(target_vmx), clone_type]
-        if snapshot:
-            args += [snapshot]
+        if snap:
+            args += [snap]
         await self.runner.run("clone", *args, timeout=max(self.settings.command_timeout, 600))
 
         # Linked/full clones keep the source display name; rename to what was asked for.
@@ -292,7 +303,7 @@ class WorkstationClient:
             "name": clone_name,
             "path": str(target_vmx),
             "clone_type": clone_type,
-            "snapshot": snapshot,
+            "snapshot": snap,
             "status": "completed",
         }
 
@@ -311,17 +322,19 @@ class WorkstationClient:
             raise InvalidArgumentError("count must be at least 1.")
         if count > 50:
             raise InvalidArgumentError("Refusing to clone more than 50 VMs in one call.")
-        prefix = name_prefix.strip() or self.inventory.resolve(identifier).name
+        prefix = validate_vm_name(name_prefix, field="name_prefix")
         created = []
         errors = []
         for index in range(1, count + 1):
-            name = f"{prefix}-{index:02d}"
+            clone_name = f"{prefix}-{index:02d}"
             try:
                 result = await self.clone_vm(
                     identifier,
-                    name,
+                    clone_name,
                     destination_dir=(
-                        str(Path(destination_dir).expanduser() / name) if destination_dir else None
+                        str(Path(destination_dir).expanduser() / clone_name)
+                        if destination_dir
+                        else None
                     ),
                     clone_type=clone_type,
                     snapshot=snapshot,
@@ -330,9 +343,11 @@ class WorkstationClient:
                     await self.change_power(result["path"], "start")
                     result["powered_on"] = True
                 created.append(result)
+            except VMwareMCPError as exc:
+                errors.append({"name": clone_name, "error": str(exc)})
             except Exception as exc:
-                logger.exception("Clone %s failed", name)
-                errors.append({"name": name, "error": str(exc)})
+                logger.exception("Clone %s failed", clone_name)
+                errors.append({"name": clone_name, "error": str(exc)})
         return {
             "requested": count,
             "created": len(created),
@@ -359,8 +374,7 @@ class WorkstationClient:
                 "cores_per_socket, memory_mb or annotation."
             )
         vm = self.inventory.resolve(identifier)
-        running = {Path(path).resolve() for path in await self.list_running()}
-        if vm.path in running:
+        if await self._is_running(vm):
             raise InvalidArgumentError(
                 f"{vm.name!r} is powered on. Power it off before changing CPU, memory or name."
             )
@@ -383,8 +397,7 @@ class WorkstationClient:
                 "Refusing to delete a VM without confirm=true. This removes the .vmx and its disks."
             )
         vm = self.inventory.resolve(identifier)
-        running = {Path(path).resolve() for path in await self.list_running()}
-        if vm.path in running:
+        if await self._is_running(vm):
             raise InvalidArgumentError(f"{vm.name!r} is powered on. Stop it before deleting.")
         await self.runner.run("deleteVM", str(vm.path))
         # deleteVM removes registered files; clean the empty directory if left behind.
@@ -411,6 +424,21 @@ class WorkstationClient:
 
     def auth(self, username: str | None = None, password: str | None = None) -> GuestAuth:
         return self.guest.resolve_auth(username, password)
+
+    async def _is_running(self, vm: DiscoveredVm) -> bool:
+        running = {normalize_path(path) for path in await self.list_running()}
+        return normalize_path(vm.path) in running
+
+    def _default_clone_dir(self, source: DiscoveredVm, clone_name: str) -> Path:
+        """Sibling of the source VM if that stays inside the library, else first VM dir."""
+        sibling = source.path.parent.parent / clone_name
+        if path_is_within_any(sibling, self.settings.vm_dirs):
+            return sibling
+        if not self.settings.vm_dirs:
+            raise InvalidArgumentError(
+                "No VM directories configured; set VMWARE_VM_DIRS before cloning."
+            )
+        return Path(self.settings.vm_dirs[0]).expanduser().resolve() / clone_name
 
 
 def _no_change(vm: DiscoveredVm, state: str, action: str) -> dict[str, Any]:
