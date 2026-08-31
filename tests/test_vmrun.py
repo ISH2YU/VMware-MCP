@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -78,13 +79,25 @@ def test_results_never_carry_the_password(tmp_path: Path):
 
 
 def test_auth_flags_are_ordered_before_the_command(tmp_path: Path):
-    settings = Settings(vm_dirs=(tmp_path,))
+    settings = Settings(vm_dirs=(tmp_path,), product=Product.WORKSTATION)
     runner = VmrunRunner(settings)
     runner._executable = tmp_path / "vmrun"
     args = runner.build_args("runProgramInGuest", "vm.vmx", auth=GuestAuth("admin", "pw"))
     assert args.index("-gu") < args.index("runProgramInGuest")
     assert args.index("runProgramInGuest") < args.index("vm.vmx")
     assert args[1:3] == ["-T", "ws"]
+
+
+def test_the_host_type_follows_the_configured_product(tmp_path: Path):
+    for product in (Product.WORKSTATION, Product.FUSION, Product.PLAYER):
+        runner = VmrunRunner(Settings(vm_dirs=(tmp_path,), product=product))
+        runner._executable = tmp_path / "vmrun"
+        assert runner.build_args("list")[1:3] == ["-T", product.value]
+
+
+def test_product_detection_matches_the_platform():
+    expected = Product.FUSION if sys.platform == "darwin" else Product.WORKSTATION
+    assert Product.detect() is expected
 
 
 def test_failure_detection_covers_stdout_error_banners():
@@ -111,26 +124,46 @@ def test_lines_strips_blanks():
     assert _result(stdout="a\n\n  b  \n").lines == ["a", "b"]
 
 
-async def test_run_reports_the_command_that_timed_out(tmp_path: Path):
-    script = tmp_path / "slow"
-    script.write_text("#!/bin/sh\nsleep 5\n")
-    script.chmod(0o755)
-    settings = Settings(vm_dirs=(tmp_path,), command_timeout=1)
-    runner = VmrunRunner(settings)
-    runner._executable = script
+def _runner(tmp_path: Path, monkeypatch, **outcome) -> VmrunRunner:
+    """A runner whose subprocess layer is replaced by a scripted outcome.
+
+    Faking at the ``run_process`` seam keeps these tests about our own logic and
+    lets them run identically on Windows, where a ``#!/bin/sh`` stub would not
+    execute at all.
+    """
+    import anyio
+
+    async def fake_run_process(*_args, **_kwargs):
+        delay = outcome.get("sleep", 0)
+        if delay:
+            await anyio.sleep(delay)
+        return SimpleNamespace(
+            returncode=outcome.get("returncode", 0),
+            stdout=outcome.get("stdout", b""),
+            stderr=outcome.get("stderr", b""),
+        )
+
+    monkeypatch.setattr("vmware_mcp.workstation.vmrun.anyio.run_process", fake_run_process)
+    runner = VmrunRunner(Settings(vm_dirs=(tmp_path,), **outcome.get("settings", {})))
+    runner._executable = tmp_path / "vmrun"
+    return runner
+
+
+async def test_run_reports_the_command_that_timed_out(tmp_path: Path, monkeypatch):
+    runner = _runner(tmp_path, monkeypatch, sleep=5)
     with pytest.raises(CommandTimeoutError) as excinfo:
-        await runner.run("list", timeout=0.2)
+        await runner.run("list", timeout=0.05)
     assert "vmrun list" in str(excinfo.value)
     assert "VMWARE_COMMAND_TIMEOUT" in str(excinfo.value)
 
 
-async def test_run_raises_with_vmrun_own_message(tmp_path: Path):
-    script = tmp_path / "failing"
-    script.write_text("#!/bin/sh\necho 'Error: The virtual machine cannot be found' >&2\nexit 1\n")
-    script.chmod(0o755)
-    settings = Settings(vm_dirs=(tmp_path,))
-    runner = VmrunRunner(settings)
-    runner._executable = script
+async def test_run_raises_with_vmrun_own_message(tmp_path: Path, monkeypatch):
+    runner = _runner(
+        tmp_path,
+        monkeypatch,
+        returncode=1,
+        stderr=b"Error: The virtual machine cannot be found\n",
+    )
     with pytest.raises(VmrunError) as excinfo:
         await runner.run("start", "ghost.vmx")
     assert "cannot be found" in str(excinfo.value)
@@ -138,16 +171,40 @@ async def test_run_raises_with_vmrun_own_message(tmp_path: Path):
     assert excinfo.value.command == "start"
 
 
-async def test_check_false_returns_the_failure(tmp_path: Path):
-    script = tmp_path / "failing"
-    script.write_text("#!/bin/sh\nexit 4\n")
-    script.chmod(0o755)
-    settings = Settings(vm_dirs=(tmp_path,))
-    runner = VmrunRunner(settings)
-    runner._executable = script
+async def test_check_false_returns_the_failure(tmp_path: Path, monkeypatch):
+    runner = _runner(tmp_path, monkeypatch, returncode=4)
     result = await runner.run("list", check=False)
     assert result.exit_code == 4
     assert result.failed
+
+
+async def test_output_is_decoded_leniently(tmp_path: Path, monkeypatch):
+    runner = _runner(tmp_path, monkeypatch, stdout=b"caf\xe9 \xff\xfe")
+    result = await runner.run("list")
+    assert "caf" in result.stdout
+
+
+@pytest.mark.skipif(not Path("/bin/sh").exists(), reason="needs a POSIX shell")
+async def test_a_real_subprocess_is_actually_spawned(tmp_path: Path):
+    """One genuine end-to-end run, so the faked tests above cannot all be wrong together."""
+    script = tmp_path / "vmrun"
+    script.write_text('#!/bin/sh\necho "Total running VMs: 0"\nexit 0\n')
+    script.chmod(0o755)
+    runner = VmrunRunner(Settings(vm_dirs=(tmp_path,)))
+    runner._executable = script
+    result = await runner.run("list")
+    assert result.lines == ["Total running VMs: 0"]
+
+
+@pytest.mark.skipif(not Path("/bin/sh").exists(), reason="needs a POSIX shell")
+async def test_a_real_slow_subprocess_hits_the_timeout(tmp_path: Path):
+    script = tmp_path / "vmrun"
+    script.write_text("#!/bin/sh\nsleep 5\n")
+    script.chmod(0o755)
+    runner = VmrunRunner(Settings(vm_dirs=(tmp_path,)))
+    runner._executable = script
+    with pytest.raises(CommandTimeoutError):
+        await runner.run("list", timeout=0.2)
 
 
 class _CountingProcess:
@@ -205,16 +262,16 @@ async def test_every_call_still_completes_under_the_cap(tmp_path: Path, monkeypa
     assert counter.in_flight == 0
 
 
-def test_version_banner_is_extracted(tmp_path: Path):
-    import anyio
+async def test_version_banner_is_extracted(tmp_path: Path, monkeypatch):
+    runner = _runner(
+        tmp_path, monkeypatch, stdout=b"vmrun version 1.17.0 build-21581411\nUsage: vmrun\n"
+    )
+    assert "vmrun version 1.17.0" in (await runner.version() or "")
 
-    script = tmp_path / "vmrun"
-    script.write_text("#!/bin/sh\necho 'vmrun version 1.17.0 build-21581411'\n")
-    script.chmod(0o755)
-    settings = Settings(vm_dirs=(tmp_path,))
-    runner = VmrunRunner(settings)
-    runner._executable = script
-    assert "vmrun version 1.17.0" in (anyio.run(runner.version) or "")
+
+async def test_a_missing_version_banner_is_none(tmp_path: Path, monkeypatch):
+    runner = _runner(tmp_path, monkeypatch, stdout=b"Usage: vmrun\n")
+    assert await runner.version() is None
 
 
 def test_product_is_exposed(tmp_path: Path):

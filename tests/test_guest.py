@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -18,6 +19,13 @@ from vmware_mcp.workstation.guest import (
     _ps_quote,
     _read_capped,
     _windows_capture_script,
+)
+
+# The wrapper these tests generate is what runs inside a *Linux guest*, so the
+# generator itself is exercised on every platform. Actually executing it to
+# prove nothing escapes needs a POSIX shell on the machine running the tests.
+requires_posix_shell = pytest.mark.skipif(
+    not Path("/bin/sh").exists(), reason="needs a POSIX shell to run the generated wrapper"
 )
 
 # --------------------------------------------------------------------------- #
@@ -49,6 +57,7 @@ def test_posix_arguments_are_split_into_separate_tokens():
         "x\ntouch {marker}",
     ],
 )
+@requires_posix_shell
 def test_posix_injection_does_not_execute(tmp_path: Path, payload: str):
     """Generate the real wrapper, run it with a real shell, prove nothing escaped."""
     marker = tmp_path / "pwned"
@@ -65,6 +74,29 @@ def test_posix_injection_does_not_execute(tmp_path: Path, payload: str):
     assert "touch" in printed or printed.strip() != "", "the argument should reach the program"
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "hello; rm -rf /",
+        "x && curl evil.example",
+        "$(whoami)",
+        "`id`",
+        "a | tee /etc/passwd",
+        "plain arguments here",
+        "quoted 'inner string' kept",
+    ],
+)
+def test_posix_wrapper_tokenises_back_to_exactly_the_intended_argv(payload: str):
+    """Portable counterpart to the execution test, so Windows CI checks this too."""
+    capture = _Capture()
+    line = _posix_capture_script("/bin/echo", payload, capture).split("\n")[0]
+    tokens = shlex.split(line)
+    redirection = tokens.index(">")
+    assert tokens[0] == "/bin/echo"
+    assert tokens[1:redirection] == shlex.split(payload), "arguments were altered"
+    assert tokens[redirection:] == [">", capture.stdout, "2>", capture.stderr]
+
+
 class _RealCapture:
     """Capture paths inside a temp dir, for tests that really run the script."""
 
@@ -75,6 +107,7 @@ class _RealCapture:
         self.script = str(root / "wrapper.sh")
 
 
+@requires_posix_shell
 def test_posix_wrapper_records_the_real_exit_code(tmp_path: Path):
     capture = _RealCapture(tmp_path)
     script = tmp_path / "wrapper.sh"
@@ -83,6 +116,7 @@ def test_posix_wrapper_records_the_real_exit_code(tmp_path: Path):
     assert _parse_exit_code(Path(capture.exit_code).read_text()) == 7
 
 
+@requires_posix_shell
 def test_posix_wrapper_separates_stdout_and_stderr(tmp_path: Path):
     capture = _RealCapture(tmp_path)
     script = tmp_path / "wrapper.sh"
