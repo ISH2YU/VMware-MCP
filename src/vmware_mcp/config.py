@@ -1,18 +1,56 @@
-"""Environment-driven configuration for the VMware MCP server."""
+"""Environment-driven configuration for local VMware Workstation / Fusion / Player."""
 
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+import sys
+import tempfile
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 
 from .errors import ConfigurationError, PermissionDeniedError
 
 ENV_PREFIX = "VMWARE_"
 
+#: Value that switches a directory allow-list off entirely.
+UNRESTRICTED = "*"
+
 _TRUE_VALUES = frozenset({"1", "true", "yes", "y", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "n", "off"})
+
+
+class Product(str, Enum):
+    """The ``vmrun -T`` host type."""
+
+    WORKSTATION = "ws"
+    FUSION = "fusion"
+    PLAYER = "player"
+
+    @classmethod
+    def parse(cls, raw: str) -> Product:
+        normalized = raw.strip().lower()
+        aliases = {
+            "ws": cls.WORKSTATION,
+            "workstation": cls.WORKSTATION,
+            "vmware workstation": cls.WORKSTATION,
+            "fusion": cls.FUSION,
+            "vmware fusion": cls.FUSION,
+            "player": cls.PLAYER,
+            "vmware player": cls.PLAYER,
+            "workstation player": cls.PLAYER,
+        }
+        try:
+            return aliases[normalized]
+        except KeyError:
+            raise ConfigurationError(
+                f"Invalid product {raw!r}. Expected 'ws', 'fusion' or 'player'."
+            ) from None
+
+    @classmethod
+    def detect(cls) -> Product:
+        return cls.FUSION if sys.platform == "darwin" else cls.WORKSTATION
 
 
 class PermissionMode(str, Enum):
@@ -62,15 +100,6 @@ _MODE_RANK: dict[PermissionMode, int] = {
 }
 
 
-def _parse_bool(value: str, *, name: str) -> bool:
-    normalized = value.strip().lower()
-    if normalized in _TRUE_VALUES:
-        return True
-    if normalized in _FALSE_VALUES:
-        return False
-    raise ConfigurationError(f"{name} must be a boolean value, got {value!r}.")
-
-
 def _parse_int(value: str, *, name: str, minimum: int | None = None) -> int:
     try:
         parsed = int(value.strip())
@@ -81,24 +110,85 @@ def _parse_int(value: str, *, name: str, minimum: int | None = None) -> int:
     return parsed
 
 
-@dataclass(frozen=True)
-class Settings:
-    """Everything the server needs to talk to vCenter/ESXi and behave itself."""
+def default_vm_directories() -> tuple[Path, ...]:
+    """Where VMware puts virtual machines by default, per platform."""
+    home = Path.home()
+    if sys.platform == "win32":
+        candidates = [
+            home / "Documents" / "Virtual Machines",
+            home / "Virtual Machines",
+        ]
+    elif sys.platform == "darwin":
+        candidates = [
+            home / "Virtual Machines.localized",
+            home / "Documents" / "Virtual Machines.localized",
+            home / "Virtual Machines",
+        ]
+    else:
+        candidates = [
+            home / "vmware",
+            home / "VMs",
+            home / "Virtual Machines",
+        ]
+    return tuple(candidates)
 
-    host: str
-    username: str
-    password: str = field(repr=False)
-    port: int = 443
-    verify_ssl: bool = True
-    ca_bundle: str | None = None
+
+def default_host_write_directory() -> Path:
+    """Scratch directory that guest-to-host copies may always write into."""
+    return Path(tempfile.gettempdir()) / "vmware-mcp"
+
+
+def _split_paths(raw: str) -> tuple[Path, ...]:
+    parts = [part.strip() for part in raw.split(os.pathsep)]
+    return tuple(Path(part).expanduser() for part in parts if part)
+
+
+@dataclass(frozen=True, kw_only=True)
+class Settings:
+    """Everything the server needs to drive local VMs and behave itself."""
+
+    vmrun_path: str | None = None
+    product: Product = field(default_factory=Product.detect)
+    vm_dirs: tuple[Path, ...] = ()
+    guest_username: str | None = None
+    guest_password: str | None = field(default=None, repr=False)
+    guest_temp_dir: str | None = None
+    vmx_password: str | None = field(default=None, repr=False)
     permission_mode: PermissionMode = PermissionMode.READ_ONLY
-    connect_timeout: int = 30
-    task_timeout: int = 600
+    command_timeout: int = 120
+    guest_timeout: int = 300
+    boot_timeout: int = 300
+    clone_timeout: int = 1800
+    max_output_bytes: int = 100_000
     max_results: int = 500
     default_page_size: int = 100
-    cache_ttl: int = 60
-    max_concurrency: int = 8
+    max_concurrency: int = 4
+    max_clone_batch: int = 50
+    cache_ttl: int = 5
+    #: Host directories that ``copy_to_guest`` may read from. Empty means anywhere.
+    host_read_dirs: tuple[Path, ...] = ()
+    #: Host directories that guest-to-host copies and screenshots may write into.
+    #: ``None`` means "not configured", which falls back to the VM library plus a
+    #: temp scratch dir. An empty tuple means the operator explicitly asked for
+    #: no restriction at all.
+    host_write_dirs: tuple[Path, ...] | None = None
     log_level: str = "INFO"
+
+    @property
+    def has_guest_credentials(self) -> bool:
+        return bool(self.guest_username)
+
+    def guest_temp(self, family: str | None) -> str:
+        """Directory inside the guest used for capture and script files."""
+        if self.guest_temp_dir:
+            return self.guest_temp_dir.rstrip("/\\")
+        return r"C:\Windows\Temp" if (family or "windows") == "windows" else "/tmp"
+
+    def effective_host_write_dirs(self) -> tuple[Path, ...]:
+        """Where the server may create files on the host. Empty means anywhere."""
+        if self.host_write_dirs is None:
+            return (*self.vm_dirs, default_host_write_directory())
+        return self.host_write_dirs
 
     def require(self, required: PermissionMode, operation: str) -> None:
         """Raise unless the configured mode permits ``operation``."""
@@ -110,94 +200,136 @@ class Settings:
             f"{ENV_PREFIX}PERMISSION_MODE={required.value} to enable it."
         )
 
-    @property
-    def endpoint(self) -> str:
-        return f"{self.host}:{self.port}"
-
     def describe(self) -> dict[str, object]:
         """A redacted view of the settings, safe to return from a tool."""
         return {
-            "host": self.host,
-            "port": self.port,
-            "username": self.username,
-            "verify_ssl": self.verify_ssl,
-            "ca_bundle": self.ca_bundle,
+            "product": self.product.value,
+            "vmrun_path": self.vmrun_path,
+            "vm_directories": [str(path) for path in self.vm_dirs],
+            "guest_username": self.guest_username,
+            "guest_credentials_configured": self.has_guest_credentials,
             "permission_mode": self.permission_mode.value,
-            "connect_timeout_seconds": self.connect_timeout,
-            "task_timeout_seconds": self.task_timeout,
+            "command_timeout_seconds": self.command_timeout,
+            "guest_timeout_seconds": self.guest_timeout,
+            "boot_timeout_seconds": self.boot_timeout,
+            "clone_timeout_seconds": self.clone_timeout,
+            "max_concurrency": self.max_concurrency,
+            "max_clone_batch": self.max_clone_batch,
             "max_results": self.max_results,
             "default_page_size": self.default_page_size,
-            "cache_ttl_seconds": self.cache_ttl,
-            "max_concurrency": self.max_concurrency,
+            "host_read_dirs": [str(path) for path in self.host_read_dirs] or "unrestricted",
+            "host_write_dirs": [str(path) for path in self.effective_host_write_dirs()]
+            or "unrestricted",
         }
 
+    def __post_init__(self) -> None:
+        if self.default_page_size > self.max_results:
+            object.__setattr__(self, "default_page_size", self.max_results)
 
-def load_settings(env: Mapping[str, str] | None = None) -> Settings:
-    """Build :class:`Settings` from environment variables.
 
-    Raises :class:`ConfigurationError` when required values are missing so the
-    process fails at startup rather than on the first tool call.
-    """
-    source: Mapping[str, str] = os.environ if env is None else env
+class _EnvReader:
+    def __init__(self, source: Mapping[str, str]) -> None:
+        self._source = source
 
-    def get(name: str, *aliases: str) -> str | None:
+    def text(self, name: str, *aliases: str) -> str | None:
         for key in (ENV_PREFIX + name, *aliases):
-            value = source.get(key)
+            value = self._source.get(key)
             if value is not None and value.strip() != "":
                 return value
         return None
 
-    host = get("HOST", "VSPHERE_HOST")
-    if not host:
-        raise ConfigurationError(
-            f"{ENV_PREFIX}HOST is required (hostname or IP of vCenter Server or an ESXi host)."
-        )
-    username = get("USERNAME", "VMWARE_USER", "VSPHERE_USER")
-    if not username:
-        raise ConfigurationError(f"{ENV_PREFIX}USERNAME is required.")
-    password = get("PASSWORD", "VSPHERE_PASSWORD")
-    if password is None:
-        raise ConfigurationError(f"{ENV_PREFIX}PASSWORD is required.")
+    def raw(self, *names: str) -> str | None:
+        """Like :meth:`text` but keeps a deliberately blank value (for passwords)."""
+        for index, name in enumerate(names):
+            key = ENV_PREFIX + name if index == 0 else name
+            if key in self._source:
+                return self._source[key]
+        return None
 
-    verify_raw = get("VERIFY_SSL")
-    verify_ssl = (
-        True if verify_raw is None else _parse_bool(verify_raw, name=f"{ENV_PREFIX}VERIFY_SSL")
-    )
-    insecure_raw = get("INSECURE")
-    if insecure_raw is not None and _parse_bool(insecure_raw, name=f"{ENV_PREFIX}INSECURE"):
-        verify_ssl = False
-
-    ca_bundle = get("CA_BUNDLE")
-    if ca_bundle is not None and not os.path.isfile(ca_bundle):
-        raise ConfigurationError(f"{ENV_PREFIX}CA_BUNDLE points at a missing file: {ca_bundle}")
-
-    permission_raw = get("PERMISSION_MODE")
-    permission_mode = (
-        PermissionMode.READ_ONLY if permission_raw is None else PermissionMode.parse(permission_raw)
-    )
-
-    def int_setting(name: str, default: int, minimum: int) -> int:
-        raw = get(name)
-        if raw is None:
+    def number(self, name: str, default: int, minimum: int) -> int:
+        value = self.text(name)
+        if value is None:
             return default
-        return _parse_int(raw, name=ENV_PREFIX + name, minimum=minimum)
+        return _parse_int(value, name=ENV_PREFIX + name, minimum=minimum)
 
-    max_results = int_setting("MAX_RESULTS", 500, 1)
-    default_page_size = min(int_setting("DEFAULT_PAGE_SIZE", 100, 1), max_results)
+    def dirs(self, name: str, *aliases: str) -> tuple[Path, ...] | None:
+        """Directory list. ``None`` when unset; ``()`` when the literal ``*`` was given."""
+        value = self.text(name, *aliases)
+        if value is None:
+            return None
+        if value.strip() == UNRESTRICTED:
+            return ()
+        paths = _split_paths(value)
+        if not paths:
+            raise ConfigurationError(
+                f"{ENV_PREFIX}{name} is set to {value!r}, which contains no usable paths. "
+                f"Use {UNRESTRICTED!r} to remove the restriction entirely."
+            )
+        return paths
+
+
+def load_settings(env: Mapping[str, str] | None = None) -> Settings:
+    """Build :class:`Settings` from environment variables."""
+    reader = _EnvReader(os.environ if env is None else env)
+
+    vmrun_path = reader.text("VMRUN_PATH", "VMWARE_VMRUN")
+    if vmrun_path is not None and not Path(vmrun_path).expanduser().is_file():
+        raise ConfigurationError(
+            f"{ENV_PREFIX}VMRUN_PATH points at something that is not a file: {vmrun_path}"
+        )
+
+    product_raw = reader.text("PRODUCT", "VMWARE_HOST_TYPE")
+    dirs_raw = reader.text("VM_DIRS", "VMWARE_VM_DIR")
+    permission_raw = reader.text("PERMISSION_MODE")
+    max_results = reader.number("MAX_RESULTS", 500, 1)
+
+    if dirs_raw:
+        vm_dirs = _split_paths(dirs_raw)
+        if not vm_dirs:
+            # Silently falling back would turn the VM sandbox off, so refuse.
+            raise ConfigurationError(
+                f"{ENV_PREFIX}VM_DIRS is set to {dirs_raw!r}, which contains no usable "
+                f"paths. Separate directories with {os.pathsep!r}."
+            )
+    else:
+        vm_dirs = default_vm_directories()
 
     return Settings(
-        host=host,
-        username=username,
-        password=password,
-        port=int_setting("PORT", 443, 1),
-        verify_ssl=verify_ssl,
-        ca_bundle=ca_bundle,
-        permission_mode=permission_mode,
-        connect_timeout=int_setting("CONNECT_TIMEOUT", 30, 1),
-        task_timeout=int_setting("TASK_TIMEOUT", 600, 1),
+        vmrun_path=str(Path(vmrun_path).expanduser()) if vmrun_path else None,
+        product=Product.parse(product_raw) if product_raw else Product.detect(),
+        vm_dirs=vm_dirs,
+        guest_username=reader.text("GUEST_USERNAME", "VMWARE_GUEST_USER"),
+        guest_password=reader.raw("GUEST_PASSWORD"),
+        guest_temp_dir=reader.text("GUEST_TEMP_DIR"),
+        vmx_password=reader.raw("VMX_PASSWORD"),
+        permission_mode=(
+            PermissionMode.READ_ONLY
+            if permission_raw is None
+            else PermissionMode.parse(permission_raw)
+        ),
+        command_timeout=reader.number("COMMAND_TIMEOUT", 120, 1),
+        guest_timeout=reader.number("GUEST_TIMEOUT", 300, 1),
+        boot_timeout=reader.number("BOOT_TIMEOUT", 300, 1),
+        clone_timeout=reader.number("CLONE_TIMEOUT", 1800, 1),
+        max_output_bytes=reader.number("MAX_OUTPUT_BYTES", 100_000, 1024),
         max_results=max_results,
-        default_page_size=default_page_size,
-        cache_ttl=int_setting("CACHE_TTL", 60, 0),
-        max_concurrency=int_setting("MAX_CONCURRENCY", 8, 1),
-        log_level=(get("LOG_LEVEL") or "INFO").upper(),
+        default_page_size=min(reader.number("DEFAULT_PAGE_SIZE", 100, 1), max_results),
+        max_concurrency=reader.number("MAX_CONCURRENCY", 4, 1),
+        max_clone_batch=reader.number("MAX_CLONE_BATCH", 50, 1),
+        cache_ttl=reader.number("CACHE_TTL", 5, 0),
+        host_read_dirs=reader.dirs("HOST_READ_DIRS") or (),
+        host_write_dirs=reader.dirs("HOST_WRITE_DIRS"),
+        log_level=(reader.text("LOG_LEVEL") or "INFO").upper(),
     )
+
+
+__all__: Sequence[str] = (
+    "ENV_PREFIX",
+    "UNRESTRICTED",
+    "PermissionMode",
+    "Product",
+    "Settings",
+    "default_host_write_directory",
+    "default_vm_directories",
+    "load_settings",
+)

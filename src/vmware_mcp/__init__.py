@@ -1,16 +1,15 @@
-"""Model Context Protocol server for VMware vSphere, vCenter Server and ESXi."""
+"""Model Context Protocol server for local VMware Workstation / Fusion / Player."""
 
 from __future__ import annotations
 
 from typing import Any
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 
 __all__ = ["__version__", "create_server", "load_settings"]
 
 
 def __getattr__(name: str) -> Any:  # pragma: no cover - thin lazy import shim
-    # Importing the server pulls in pyVmomi, which is slow; keep `import vmware_mcp` cheap.
     if name == "create_server":
         from .server import create_server
 

@@ -11,10 +11,9 @@ from collections.abc import Sequence
 
 import anyio
 
+from . import __version__
 from .config import ENV_PREFIX, Settings, load_settings
 from .errors import VMwareMCPError
-from .vsphere import mappers
-from .vsphere.client import VSphereClient
 
 logger = logging.getLogger("vmware_mcp")
 
@@ -23,21 +22,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vmware-mcp",
         description=(
-            "Model Context Protocol server for VMware vSphere. Configuration comes from "
-            f"{ENV_PREFIX}* environment variables; the flags below override them."
+            "Model Context Protocol server for local VMware Workstation, Fusion or Player. "
+            f"Configuration comes from {ENV_PREFIX}* environment variables; flags override them."
         ),
     )
-    connection = parser.add_argument_group("vSphere connection")
-    connection.add_argument("--vsphere-host", metavar="HOST", help="vCenter or ESXi hostname.")
-    connection.add_argument("--vsphere-port", type=int, metavar="PORT", help="Default 443.")
-    connection.add_argument("--username", metavar="USER", help="vSphere username.")
-    connection.add_argument(
-        "--insecure",
-        action="store_true",
-        help="Skip TLS certificate verification. Lab use only.",
+    local = parser.add_argument_group("VMware Workstation / Fusion")
+    local.add_argument("--vmrun", metavar="PATH", help="Path to the vmrun executable.")
+    local.add_argument(
+        "--product",
+        choices=["ws", "fusion", "player"],
+        help="vmrun host type. Default: ws on Windows/Linux, fusion on macOS.",
     )
-    connection.add_argument("--ca-bundle", metavar="PATH", help="CA certificate bundle to trust.")
-    connection.add_argument(
+    local.add_argument(
+        "--vm-dir",
+        action="append",
+        dest="vm_dirs",
+        metavar="DIR",
+        help="Directory to scan for .vmx files. Repeatable. Overrides VMWARE_VM_DIRS.",
+    )
+    local.add_argument("--guest-user", metavar="USER", help="Default guest OS username.")
+    local.add_argument(
         "--permission-mode",
         choices=["read-only", "write", "destructive"],
         help="How much the server is allowed to change. Default read-only.",
@@ -57,22 +61,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Connect to vSphere, print what was found and exit. Use this to verify credentials.",
+        help="Find vmrun, scan VM directories, print a short summary and exit.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"vmware-mcp {__version__}",
+        help="Print the version and exit.",
     )
     return parser
 
 
 def settings_from_args(args: argparse.Namespace) -> Settings:
     """Environment settings with the CLI overrides applied on top."""
-    overrides = {
-        f"{ENV_PREFIX}HOST": args.vsphere_host,
-        f"{ENV_PREFIX}PORT": str(args.vsphere_port) if args.vsphere_port else None,
-        f"{ENV_PREFIX}USERNAME": args.username,
-        f"{ENV_PREFIX}CA_BUNDLE": args.ca_bundle,
+    overrides: dict[str, str | None] = {
+        f"{ENV_PREFIX}VMRUN_PATH": args.vmrun,
+        f"{ENV_PREFIX}PRODUCT": args.product,
+        f"{ENV_PREFIX}GUEST_USERNAME": args.guest_user,
         f"{ENV_PREFIX}PERMISSION_MODE": args.permission_mode,
         f"{ENV_PREFIX}LOG_LEVEL": args.log_level,
-        f"{ENV_PREFIX}VERIFY_SSL": "false" if args.insecure else None,
     }
+    if args.vm_dirs:
+        overrides[f"{ENV_PREFIX}VM_DIRS"] = os.pathsep.join(args.vm_dirs)
+
     env = dict(os.environ)
     env.update({key: value for key, value in overrides.items() if value is not None})
     return load_settings(env)
@@ -88,19 +99,12 @@ def configure_logging(level: str) -> None:
 
 
 async def check_connection(settings: Settings) -> int:
-    """Verify credentials and print a short inventory summary."""
-    client = VSphereClient(settings)
+    """Verify vmrun and print a short inventory summary."""
+    from .workstation import WorkstationClient
+
+    client = WorkstationClient(settings)
     try:
-        info = await client.about()
-        index = await client.path_index()
-        report = {
-            "endpoint": settings.endpoint,
-            "permission_mode": settings.permission_mode.value,
-            "verify_ssl": settings.verify_ssl,
-            "authenticated_as": info["session_user"],
-            "server": mappers.map_about_info(info["about"]),
-            "inventory_objects_indexed": index.size,
-        }
+        report = await client.about()
         print(json.dumps(report, indent=2))
         return 0
     finally:
@@ -124,12 +128,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Connection check failed: {exc}", file=sys.stderr)
             return 1
 
-    from .server import create_server  # imported late so --check stays fast
+    from .server import create_server
 
     server = create_server(settings)
     logger.info(
-        "Starting vmware-mcp against %s in %s mode over %s",
-        settings.endpoint,
+        "Starting vmware-mcp for local %s in %s mode over %s",
+        settings.product.value,
         settings.permission_mode.value,
         args.transport,
     )

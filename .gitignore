@@ -12,3 +12,8 @@ venv/
 .coverage
 coverage.xml
 htmlcov/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
