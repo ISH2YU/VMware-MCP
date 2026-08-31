@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vmware-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "Model Context Protocol server for local VMware Workstation, Fusion and Player"
 readme = "README.md"
 license = { file = "LICENSE" }

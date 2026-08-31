@@ -7,7 +7,9 @@ reconfiguration means editing this file while the VM is powered off.
 
 from __future__ import annotations
 
+import os
 import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,7 +33,6 @@ class VmxFile:
     entries: dict[str, str] = field(default_factory=dict)
     # Keys in the order they appeared; used so a rewrite does not scramble the file.
     order: list[str] = field(default_factory=list)
-    raw_lines: list[str] = field(default_factory=list)
 
     def get(self, key: str, default: str | None = None) -> str | None:
         return self.entries.get(key.lower(), default)
@@ -60,7 +61,7 @@ class VmxFile:
     def write(self) -> None:
         """Atomically replace the ``.vmx`` so a crash cannot leave a half-written file."""
         data = self.as_text()
-        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}-{uuid.uuid4().hex[:8]}.tmp")
         try:
             tmp.write_text(data, encoding=self.encoding)
             tmp.replace(self.path)
@@ -128,9 +129,7 @@ def load_vmx(path: Path | str) -> VmxFile:
         if key == ".encoding":
             encoding = value or encoding
 
-    return VmxFile(
-        path=target, encoding=encoding, entries=entries, order=order, raw_lines=text.splitlines()
-    )
+    return VmxFile(path=target, encoding=encoding, entries=entries, order=order)
 
 
 def guest_os_family(guest_os: str | None) -> str | None:

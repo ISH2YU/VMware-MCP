@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
-import fnmatch
 import functools
 import inspect
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
 
 from ..config import Settings
 from ..errors import InvalidArgumentError, VMwareMCPError
 from ..workstation import WorkstationClient
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True)
+MUTATING = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False)
+DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False)
 
 
 @dataclass(frozen=True)
@@ -30,8 +34,9 @@ class ToolContext:
 def mcp_tool(server: MCPServer, **kwargs: Any) -> Callable[[F], F]:
     """``server.tool`` with a cleaned docstring and anticipated-error wrapping.
 
-    ``VMwareMCPError`` is raised as MCP ``ToolError`` so the client sees the
-    real message (permission mode, unknown VM, …) instead of a generic crash.
+    ``VMwareMCPError`` is reported as an MCP ``ToolError`` so the client sees the
+    real reason (permission mode, unknown VM, vmrun's own message) instead of a
+    generic "error executing tool".
     """
 
     def decorator(func: F) -> F:
@@ -47,27 +52,6 @@ def mcp_tool(server: MCPServer, **kwargs: Any) -> Callable[[F], F]:
         return server.tool(description=description, **kwargs)(wrapper)  # type: ignore[return-value]
 
     return decorator
-
-
-def name_matches(value: str | None, pattern: str | None) -> bool:
-    """Case-insensitive match; ``*``/``?`` switch from substring to glob matching."""
-    if not pattern:
-        return True
-    if value is None:
-        return False
-    lowered_value = value.lower()
-    lowered_pattern = pattern.lower()
-    if any(char in lowered_pattern for char in "*?["):
-        return fnmatch.fnmatch(lowered_value, lowered_pattern)
-    return lowered_pattern in lowered_value
-
-
-def equals_any(value: str | None, allowed: Sequence[str] | None) -> bool:
-    if not allowed:
-        return True
-    if value is None:
-        return False
-    return value.lower() in {item.lower() for item in allowed}
 
 
 def resolve_limit(limit: int | None, settings: Settings) -> int:
@@ -95,12 +79,12 @@ def paginate(
     }
 
 
-def sort_by_name(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    return sorted(items, key=lambda item: (item.get("name") or "").lower())
-
-
-def require_non_empty(value: str, field: str) -> str:
-    stripped = (value or "").strip()
-    if not stripped:
-        raise InvalidArgumentError(f"{field} must not be empty.")
-    return stripped
+__all__ = [
+    "DESTRUCTIVE",
+    "MUTATING",
+    "READ_ONLY",
+    "ToolContext",
+    "mcp_tool",
+    "paginate",
+    "resolve_limit",
+]

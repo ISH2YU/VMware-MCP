@@ -5,14 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from mcp.server import MCPServer
-from mcp.types import ToolAnnotations
 
 from ...config import PermissionMode
-from .._common import ToolContext, mcp_tool, require_non_empty
-
-READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True)
-MUTATING = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False)
-DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False)
+from .._common import DESTRUCTIVE, MUTATING, READ_ONLY, ToolContext, mcp_tool
 
 
 def register(server: MCPServer, context: ToolContext) -> None:
@@ -26,8 +21,8 @@ def register(server: MCPServer, context: ToolContext) -> None:
         Args:
             vm: Display name, ``.vmx`` path, directory name or BIOS UUID.
         """
-        snapshots = await client.list_snapshots(vm)
-        resolved = client.resolve(vm)
+        resolved = await client.resolve_async(vm)
+        snapshots = await client.list_snapshots(str(resolved.path))
         return {
             "vm": resolved.name,
             "path": str(resolved.path),
@@ -47,10 +42,10 @@ def register(server: MCPServer, context: ToolContext) -> None:
 
         Args:
             vm: Display name, ``.vmx`` path, directory name or BIOS UUID.
-            name: Name for the new snapshot.
+            name: Name for the new snapshot. No path separators.
         """
         settings.require(PermissionMode.WRITE, "vmware_create_snapshot")
-        return await client.create_snapshot(vm, require_non_empty(name, "name"))
+        return await client.create_snapshot(vm, name)
 
     @mcp_tool(server, annotations=DESTRUCTIVE)
     async def vmware_revert_snapshot(vm: str, snapshot: str) -> dict[str, Any]:
@@ -63,7 +58,28 @@ def register(server: MCPServer, context: ToolContext) -> None:
             snapshot: Snapshot name.
         """
         settings.require(PermissionMode.DESTRUCTIVE, "vmware_revert_snapshot")
-        return await client.revert_snapshot(vm, require_non_empty(snapshot, "snapshot"))
+        return await client.revert_snapshot(vm, snapshot)
+
+    @mcp_tool(server, annotations=DESTRUCTIVE)
+    async def vmware_revert_many(
+        pattern: str, snapshot: str, dry_run: bool = False
+    ) -> dict[str, Any]:
+        """Revert every VM matching ``pattern`` back to a snapshot.
+
+        This is the "reset the whole test lab" call: it stops each matching VM
+        if it is running, then reverts it. Use ``dry_run=true`` first to confirm
+        the match list.
+
+        Requires permission mode ``destructive``.
+
+        Args:
+            pattern: Name filter, e.g. ``web-test-*``.
+            snapshot: Snapshot name that every matching VM should return to.
+            dry_run: Only report which VMs match; change nothing.
+        """
+        if not dry_run:
+            settings.require(PermissionMode.DESTRUCTIVE, "vmware_revert_many")
+        return await client.revert_many(pattern, snapshot, dry_run=dry_run)
 
     @mcp_tool(server, annotations=DESTRUCTIVE)
     async def vmware_delete_snapshot(
@@ -79,6 +95,4 @@ def register(server: MCPServer, context: ToolContext) -> None:
             delete_children: Also delete snapshots taken from this one.
         """
         settings.require(PermissionMode.DESTRUCTIVE, "vmware_delete_snapshot")
-        return await client.delete_snapshot(
-            vm, require_non_empty(snapshot, "snapshot"), delete_children=delete_children
-        )
+        return await client.delete_snapshot(vm, snapshot, delete_children=delete_children)

@@ -5,15 +5,25 @@ from __future__ import annotations
 import fnmatch
 import logging
 import time
+from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import anyio
+import anyio.to_thread
 
 from ..errors import AmbiguousObjectError, ObjectNotFoundError
 from .paths import normalize_path, require_within_vm_dirs
 from .vmx import VmxFile, guest_os_family, load_vmx
 
 logger = logging.getLogger(__name__)
+
+#: Directory names that never contain a VM worth managing.
+_SKIP_DIRECTORIES = frozenset(
+    {"__pycache__", "node_modules", "$recycle.bin", "system volume information"}
+)
 
 
 @dataclass(frozen=True)
@@ -53,71 +63,144 @@ class DiscoveredVm:
         }
 
 
+#: ``VmInventory.list`` shadows the builtin inside the class body, so annotations
+#: there use this alias instead.
+VmList = list[DiscoveredVm]
+
+
 def discover_vmx_files(
-    directories: list[Path] | tuple[Path, ...], *, max_depth: int = 4
+    directories: Sequence[Path],
+    *,
+    max_depth: int = 4,
+    max_files: int = 5000,
 ) -> list[Path]:
     """Walk ``directories`` looking for ``.vmx`` files.
 
-    Skips clone scratch dirs (``*-Snapshot*``) and anything under a ``.lck``
-    lock directory. Depth is capped so a mis-pointed ``VMWARE_VM_DIRS`` at ``/``
-    does not hang the process.
+    Skips clone scratch dirs and anything under a ``.lck`` lock directory. The
+    walk is breadth-first, depth-capped and remembers which real directories it
+    has already entered, so a symlink pointing at an ancestor cannot spin
+    forever and a mis-pointed ``VMWARE_VM_DIRS`` at ``/`` cannot hang the
+    process.
     """
     found: list[Path] = []
-    seen: set[Path] = set()
+    seen_files: set[str] = set()
+    visited_dirs: set[str] = set()
+
     for directory in directories:
-        root = directory.expanduser().resolve()
+        root = directory.expanduser()
+        try:
+            root = root.resolve()
+        except OSError:
+            continue
         if not root.is_dir():
             logger.debug("VM directory does not exist, skipping: %s", root)
             continue
-        for path in _walk_vmx(root, max_depth=max_depth):
-            resolved = path.resolve()
-            if resolved in seen:
+
+        queue: deque[tuple[Path, int]] = deque([(root, max_depth)])
+        while queue:
+            current, depth = queue.popleft()
+            key = normalize_path(current)
+            if key in visited_dirs:
                 continue
-            seen.add(resolved)
-            found.append(resolved)
+            visited_dirs.add(key)
+            try:
+                entries = sorted(current.iterdir(), key=lambda item: item.name.lower())
+            except (PermissionError, OSError) as exc:
+                logger.debug("Cannot read %s: %s", current, exc)
+                continue
+            for entry in entries:
+                name = entry.name
+                lowered = name.lower()
+                if name.startswith(".") or lowered.endswith(".lck"):
+                    continue
+                if lowered in _SKIP_DIRECTORIES:
+                    continue
+                try:
+                    is_dir = entry.is_dir()
+                    is_file = entry.is_file()
+                except OSError:
+                    continue
+                if is_file and lowered.endswith(".vmx"):
+                    try:
+                        resolved = entry.resolve()
+                    except OSError:
+                        continue
+                    marker = normalize_path(resolved)
+                    if marker in seen_files:
+                        continue
+                    seen_files.add(marker)
+                    found.append(resolved)
+                    if len(found) >= max_files:
+                        logger.warning(
+                            "Stopped scanning after %d .vmx files; narrow VMWARE_VM_DIRS.",
+                            max_files,
+                        )
+                        return sorted(found, key=lambda item: item.name.lower())
+                elif is_dir and depth > 0:
+                    queue.append((entry, depth - 1))
+
     return sorted(found, key=lambda item: item.name.lower())
 
 
-def _walk_vmx(root: Path, *, max_depth: int) -> list[Path]:
-    results: list[Path] = []
-    try:
-        for entry in root.iterdir():
-            name = entry.name
-            if name.startswith(".") or name.endswith(".lck"):
-                continue
-            if entry.is_file() and name.lower().endswith(".vmx"):
-                results.append(entry)
-            elif entry.is_dir() and max_depth > 0:
-                results.extend(_walk_vmx(entry, max_depth=max_depth - 1))
-    except PermissionError:
-        logger.debug("Permission denied reading %s", root)
-    return results
-
-
 class VmInventory:
-    """Cached catalogue of local VMs, keyed for flexible lookup."""
+    """Cached catalogue of local VMs, keyed for flexible lookup.
 
-    def __init__(self, directories: list[Path] | tuple[Path, ...], *, ttl: float = 5.0) -> None:
+    Scanning touches the filesystem, so refreshes happen in a worker thread and
+    are serialised by a lock: several concurrent tool calls share one scan
+    instead of each launching their own.
+    """
+
+    def __init__(self, directories: Sequence[Path], *, ttl: float = 5.0) -> None:
         self._directories = tuple(directories)
         self._ttl = ttl
-        self._vms: list[DiscoveredVm] = []
-        self._fetched_at = 0.0
+        self._vms: VmList = []
+        self._fetched_at: float | None = None
+        self._lock = anyio.Lock()
 
-    def refresh(self, *, force: bool = False) -> list[DiscoveredVm]:
-        if not force and self._vms and (time.monotonic() - self._fetched_at) < self._ttl:
-            return list(self._vms)
-        discovered: list[DiscoveredVm] = []
+    @property
+    def directories(self) -> tuple[Path, ...]:
+        return self._directories
+
+    def _is_fresh(self) -> bool:
+        return self._fetched_at is not None and (time.monotonic() - self._fetched_at) < self._ttl
+
+    def _scan(self) -> VmList:
+        discovered: VmList = []
         for path in discover_vmx_files(self._directories):
             try:
                 discovered.append(DiscoveredVm.from_vmx(load_vmx(path)))
             except Exception:
                 logger.warning("Skipping unreadable .vmx at %s", path, exc_info=True)
-        self._vms = discovered
+        return discovered
+
+    def refresh(self, *, force: bool = False) -> VmList:
+        """Synchronous refresh, used from non-async call sites and tests."""
+        if not force and self._is_fresh():
+            return list(self._vms)
+        self._vms = self._scan()
         self._fetched_at = time.monotonic()
         return list(self._vms)
 
-    def list(self) -> list[DiscoveredVm]:
+    async def refresh_async(self, *, force: bool = False) -> VmList:
+        """Refresh off the event loop, collapsing concurrent callers into one scan."""
+        if not force and self._is_fresh():
+            return list(self._vms)
+        async with self._lock:
+            if not force and self._is_fresh():
+                return list(self._vms)
+            self._vms = await anyio.to_thread.run_sync(self._scan)
+            self._fetched_at = time.monotonic()
+            return list(self._vms)
+
+    def invalidate(self) -> None:
+        """Drop the cache so the next lookup rescans."""
+        self._fetched_at = None
+
+    def list(self) -> VmList:
         return self.refresh()
+
+    async def list_async(self) -> VmList:
+        return await self.refresh_async()
 
     def resolve(self, identifier: str) -> DiscoveredVm:
         """Find exactly one VM by name, path, stem or UUID.
@@ -126,32 +209,34 @@ class VmInventory:
         VM directories. That is the sandbox: tools cannot power, clone or delete
         machines the operator did not expose via ``VMWARE_VM_DIRS``.
         """
+        return self._match(identifier, self.refresh())
+
+    async def resolve_async(self, identifier: str) -> DiscoveredVm:
+        return self._match(identifier, await self.refresh_async())
+
+    def _match(self, identifier: str, vms: VmList) -> DiscoveredVm:
         needle = identifier.strip()
         if not needle:
             raise ObjectNotFoundError("VM identifier must not be empty.")
-        vms = self.refresh()
 
         as_path = Path(needle).expanduser()
-        looks_like_vmx = as_path.suffix.lower() == ".vmx" or (
-            as_path.exists() and as_path.suffix.lower() == ".vmx"
-        )
-        if looks_like_vmx or (as_path.exists() and as_path.is_file()):
-            resolved = as_path.resolve()
-            if resolved.is_file() and resolved.suffix.lower() == ".vmx":
-                require_within_vm_dirs(resolved, self._directories, what="VM")
-                target = normalize_path(resolved)
-                for vm in vms:
-                    if normalize_path(vm.path) == target:
-                        return vm
+        if as_path.suffix.lower() == ".vmx":
+            resolved = require_within_vm_dirs(as_path, self._directories, what="VM")
+            target = normalize_path(resolved)
+            for vm in vms:
+                if normalize_path(vm.path) == target:
+                    return vm
+            if resolved.is_file():
                 return DiscoveredVm.from_vmx(load_vmx(resolved))
+            raise ObjectNotFoundError(f"No .vmx file at {resolved}.")
 
         lowered = needle.lower()
         for tier in (
-            [vm for vm in vms if str(vm.path).lower() == lowered],
             [vm for vm in vms if vm.uuid and vm.uuid.lower() == lowered],
             [vm for vm in vms if vm.name == needle],
-            [vm for vm in vms if vm.path.stem.lower() == lowered],
             [vm for vm in vms if vm.name.lower() == lowered],
+            [vm for vm in vms if vm.path.stem.lower() == lowered],
+            [vm for vm in vms if vm.path.parent.name.lower() == lowered],
         ):
             if len(tier) == 1:
                 return tier[0]
@@ -171,6 +256,7 @@ class VmInventory:
 
 
 def name_matches(value: str | None, pattern: str | None) -> bool:
+    """Case-insensitive match; ``*``/``?`` switch from substring to glob matching."""
     if not pattern:
         return True
     if value is None:
@@ -189,3 +275,11 @@ def _as_int(value: str | None) -> int | None:
         return int(value)
     except ValueError:
         return None
+
+
+__all__ = [
+    "DiscoveredVm",
+    "VmInventory",
+    "discover_vmx_files",
+    "name_matches",
+]

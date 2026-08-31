@@ -3,6 +3,14 @@
 ``vmrun`` ships with Workstation, Fusion and Player and is the supported way to
 script a local hypervisor. It is a plain executable, so every call here is a
 subprocess; they run on the event loop via anyio rather than blocking it.
+
+Two things make this wrapper more than ``subprocess.run``:
+
+* ``vmrun`` is unhappy when many copies fight over the same VM library, so calls
+  are funnelled through a semaphore sized by ``VMWARE_MAX_CONCURRENCY``.
+* guest credentials appear on the command line, so the arguments kept on results
+  and log lines are redacted at the point of construction rather than at the
+  point of printing.
 """
 
 from __future__ import annotations
@@ -21,6 +29,9 @@ from ..errors import CommandTimeoutError, VmrunError, VmrunNotFoundError
 
 logger = logging.getLogger(__name__)
 
+#: Flags whose following value must never be logged or stored.
+SECRET_FLAGS = frozenset({"-gp", "-vp"})
+
 #: Standard install locations, checked when ``vmrun`` is not on ``PATH``.
 KNOWN_LOCATIONS: dict[str, tuple[str, ...]] = {
     "win32": (
@@ -29,16 +40,20 @@ KNOWN_LOCATIONS: dict[str, tuple[str, ...]] = {
         r"C:\Program Files (x86)\VMware\VMware Player\vmrun.exe",
         r"C:\Program Files\VMware\VMware Player\vmrun.exe",
         r"C:\Program Files (x86)\VMware\VMware VIX\vmrun.exe",
+        r"C:\Program Files\VMware\VMware VIX\vmrun.exe",
     ),
     "darwin": (
         "/Applications/VMware Fusion.app/Contents/Public/vmrun",
         "/Applications/VMware Fusion Tech Preview.app/Contents/Public/vmrun",
+        "/Applications/VMware Fusion.app/Contents/Library/vmrun",
         "/Library/Application Support/VMware Fusion/vmrun",
+        "/Applications/VMware Fusion.app/Contents/Library/VMware Fusion.app/Contents/Public/vmrun",
     ),
     "linux": (
         "/usr/bin/vmrun",
         "/usr/local/bin/vmrun",
         "/opt/vmware/bin/vmrun",
+        "/usr/lib/vmware/bin/vmrun",
     ),
 }
 
@@ -76,12 +91,44 @@ _ERROR_HINTS: tuple[tuple[str, str], ...] = (
         "the snapshot already exists",
         "A snapshot with that name already exists on this VM.",
     ),
+    (
+        "a file was not found",
+        "VMware could not find a file it needed. For guest operations, check the "
+        "path exists inside the guest.",
+    ),
+    (
+        "the virtual machine is already powered on",
+        "That VM is already running.",
+    ),
+    (
+        "cannot connect to the virtual machine",
+        "VMware could not attach to the VM. Make sure Workstation is installed "
+        "correctly and the VM is not locked by another process.",
+    ),
 )
+
+
+def redact(args: Sequence[str]) -> tuple[str, ...]:
+    """Copy of ``args`` with the value after every secret flag replaced."""
+    rendered: list[str] = []
+    redact_next = False
+    for arg in args:
+        if redact_next:
+            rendered.append("***")
+            redact_next = False
+            continue
+        rendered.append(arg)
+        redact_next = arg in SECRET_FLAGS
+    return tuple(rendered)
 
 
 @dataclass(frozen=True)
 class VmrunResult:
-    """The outcome of one ``vmrun`` invocation."""
+    """The outcome of one ``vmrun`` invocation.
+
+    ``args`` is already redacted, so a result may be logged or serialised
+    without leaking the guest password that was on the command line.
+    """
 
     args: tuple[str, ...]
     exit_code: int
@@ -95,6 +142,11 @@ class VmrunResult:
     @property
     def lines(self) -> list[str]:
         return [line.strip() for line in self.stdout.splitlines() if line.strip()]
+
+    @property
+    def failed(self) -> bool:
+        """vmrun sometimes exits 0 while printing an error to stdout."""
+        return self.exit_code != 0 or self.output.lower().startswith("error:")
 
 
 def find_vmrun(explicit: str | None = None) -> Path:
@@ -154,6 +206,7 @@ class VmrunRunner:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._executable: Path | None = None
+        self._slots = anyio.Semaphore(max(1, settings.max_concurrency))
 
     @property
     def product(self) -> Product:
@@ -185,28 +238,33 @@ class VmrunRunner:
     ) -> VmrunResult:
         """Invoke ``vmrun`` and return its output.
 
-        With ``check`` set, a non-zero exit raises :class:`VmrunError` carrying
-        vmrun's own message rather than a bare exit status.
+        With ``check`` set, a failure raises :class:`VmrunError` carrying vmrun's
+        own message. A failure means a non-zero exit *or* an ``Error:`` banner on
+        stdout, because vmrun does both depending on the command.
         """
         args = self.build_args(command, *arguments, auth=auth)
+        safe_args = redact(args)
         limit = self._settings.command_timeout if timeout is None else timeout
-        logger.debug("Running: %s", _redact(args))
-        try:
-            with anyio.fail_after(limit):
-                completed = await anyio.run_process(args, check=False)
-        except TimeoutError:
-            raise CommandTimeoutError(
-                f"'vmrun {command}' did not finish within {limit:g}s and was stopped. "
-                f"Long operations such as cloning a large VM may need a higher "
-                f"VMWARE_COMMAND_TIMEOUT."
-            ) from None
+        logger.debug("Running: %s", " ".join(safe_args))
+
+        async with self._slots:
+            try:
+                with anyio.fail_after(limit):
+                    completed = await anyio.run_process(args, check=False)
+            except TimeoutError:
+                raise CommandTimeoutError(
+                    f"'vmrun {command}' did not finish within {limit:g}s and was stopped. "
+                    f"Long operations such as cloning a large VM may need a higher "
+                    f"VMWARE_COMMAND_TIMEOUT (or VMWARE_CLONE_TIMEOUT for clones)."
+                ) from None
+
         result = VmrunResult(
-            args=tuple(args),
+            args=safe_args,
             exit_code=completed.returncode,
             stdout=completed.stdout.decode("utf-8", "replace"),
             stderr=completed.stderr.decode("utf-8", "replace"),
         )
-        if check and result.exit_code != 0:
+        if check and result.failed:
             raise VmrunError(describe_failure(result), command=command, exit_code=result.exit_code)
         return result
 
@@ -223,15 +281,13 @@ class VmrunRunner:
         return None
 
 
-def _redact(args: Sequence[str]) -> str:
-    """Render a command line for logs without leaking passwords."""
-    rendered: list[str] = []
-    redact_next = False
-    for arg in args:
-        if redact_next:
-            rendered.append("***")
-            redact_next = False
-            continue
-        rendered.append(arg)
-        redact_next = arg in {"-gp", "-vp"}
-    return " ".join(rendered)
+__all__ = [
+    "KNOWN_LOCATIONS",
+    "SECRET_FLAGS",
+    "GuestAuth",
+    "VmrunResult",
+    "VmrunRunner",
+    "describe_failure",
+    "find_vmrun",
+    "redact",
+]

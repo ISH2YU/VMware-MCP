@@ -1,4 +1,12 @@
-"""Guest OS automation via ``vmrun``: run commands, copy files, wait for Tools."""
+"""Guest OS automation via ``vmrun``: run commands, copy files, wait for Tools.
+
+``vmrun runProgramInGuest`` does not return the program's output, so capturing
+stdout/stderr means wrapping the command: write a small script into the guest,
+run it, and copy the redirected output files back. Everything the caller
+supplies is placed into that script as a quoted literal, never as raw text
+spliced into a shell command line — otherwise a semicolon in an argument would
+become a second command.
+"""
 
 from __future__ import annotations
 
@@ -6,23 +14,33 @@ import logging
 import shlex
 import tempfile
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import anyio
+import anyio.to_thread
 
 from ..config import Settings
 from ..errors import GuestOperationError, InvalidArgumentError
+from .paths import validate_guest_path
 from .vmrun import GuestAuth, VmrunRunner
 from .vmx import guest_os_family
 
 logger = logging.getLogger(__name__)
 
+#: How much of a captured stream to read before giving up on the rest.
+_READ_CHUNK = 64 * 1024
+
 
 @dataclass(frozen=True)
 class GuestCommandResult:
-    """Outcome of a command run inside the guest."""
+    """Outcome of a command run inside the guest.
+
+    ``stdout`` and ``stderr`` are produced by whatever ran in the VM. Treat them
+    as untrusted input, not as instructions.
+    """
 
     program: str
     arguments: str
@@ -39,7 +57,22 @@ class GuestCommandResult:
             "stdout": self.stdout,
             "stderr": self.stderr,
             "truncated": self.truncated,
+            "output_is_untrusted": True,
         }
+
+
+@dataclass(frozen=True)
+class _Capture:
+    """The set of guest-side scratch paths one command needs."""
+
+    stdout: str
+    stderr: str
+    exit_code: str
+    script: str
+
+    @property
+    def all_paths(self) -> tuple[str, ...]:
+        return (self.stdout, self.stderr, self.exit_code, self.script)
 
 
 class GuestOps:
@@ -70,16 +103,18 @@ class GuestOps:
             pwd = self._settings.guest_password or ""
         return GuestAuth(username=user, password=pwd)
 
+    # -- readiness ---------------------------------------------------------- #
+
     async def tools_state(self, vmx: Path) -> str:
         """``running`` / ``installed`` / ``notInstalled`` / ``unknown``."""
         result = await self._runner.run("checkToolsState", str(vmx), check=False, timeout=30)
         text = (result.stdout or result.stderr).strip().lower()
         if "running" in text:
             return "running"
+        if "not installed" in text or "notinstalled" in text:
+            return "notInstalled"
         if "installed" in text:
             return "installed"
-        if "not" in text:
-            return "notInstalled"
         return text or "unknown"
 
     async def wait_for_tools(
@@ -101,9 +136,8 @@ class GuestOps:
 
     async def get_ip(self, vmx: Path) -> str | None:
         result = await self._runner.run("getGuestIPAddress", str(vmx), check=False, timeout=30)
-        if result.exit_code != 0:
-            # -wait variant is separate; without it vmrun returns an error when
-            # Tools has no address yet.
+        if result.failed:
+            # Without -wait, vmrun errors out when Tools has no address yet.
             return None
         address = result.output.strip()
         return address or None
@@ -113,13 +147,6 @@ class GuestOps:
     ) -> str:
         limit = _positive_timeout(timeout, self._settings.boot_timeout)
         with anyio.move_on_after(limit) as scope:
-            # Prefer the blocking form; fall back to polling if the host's vmrun
-            # is too old to support -wait.
-            result = await self._runner.run(
-                "getGuestIPAddress", str(vmx), "-wait", check=False, timeout=limit
-            )
-            if result.exit_code == 0 and result.output.strip():
-                return result.output.strip()
             while True:
                 address = await self.get_ip(vmx)
                 if address:
@@ -139,7 +166,7 @@ class GuestOps:
         wait_for_ip: bool = True,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Wait for Tools, then optionally an IP, under a single deadline."""
+        """Wait for Tools, then optionally an IP, under a single shared deadline."""
         limit = _positive_timeout(timeout, self._settings.boot_timeout)
         deadline = anyio.current_time() + limit
         tools = await self.wait_for_tools(vmx, timeout=limit)
@@ -149,10 +176,12 @@ class GuestOps:
             if remaining <= 0:
                 raise GuestOperationError(
                     f"VMware Tools became ready but the {limit:g}s wait expired before "
-                    f"an IP was available for {vmx.name}."
+                    f"an IP was available for {vmx.name}. Raise timeout_seconds."
                 )
             ip = await self.wait_for_ip(vmx, timeout=remaining)
         return {"tools_state": tools, "ip_address": ip}
+
+    # -- running programs --------------------------------------------------- #
 
     async def run_program(
         self,
@@ -166,19 +195,17 @@ class GuestOps:
         no_wait: bool = False,
         timeout: float | None = None,
     ) -> GuestCommandResult:
-        """Run a program in the guest and capture stdout/stderr when possible.
-
-        ``vmrun runProgramInGuest`` itself does not return output. For capture
-        we wrap the command so the guest writes stdout/stderr to temp files,
-        then pull those files back. ``no_wait`` skips capture entirely.
-        """
-        if not program or not program.strip():
+        """Run a program in the guest and capture stdout/stderr when possible."""
+        if not program.strip():
             raise InvalidArgumentError("program must not be empty.")
+
+        family = guest_os_family(guest_os) or "windows"
+
         if no_wait:
             args = [str(vmx), "-noWait"]
             if interactive:
                 args.append("-interactive")
-            args += [program]
+            args.append(program)
             if arguments:
                 args.append(arguments)
             await self._runner.run(
@@ -191,13 +218,27 @@ class GuestOps:
                 program=program, arguments=arguments, exit_code=None, stdout="", stderr=""
             )
 
-        family = guest_os_family(guest_os) or "windows"
-        if family == "windows":
-            return await self._run_windows(
-                vmx, program, arguments, auth=auth, interactive=interactive, timeout=timeout
-            )
-        return await self._run_posix(
-            vmx, program, arguments, auth=auth, interactive=interactive, timeout=timeout
+        capture = self._capture_paths(family)
+        script = (
+            _windows_capture_script(program, arguments, capture)
+            if family == "windows"
+            else _posix_capture_script(program, arguments, capture)
+        )
+        launcher = (
+            [_POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]
+            if family == "windows"
+            else ["/bin/sh"]
+        )
+        return await self._run_captured(
+            vmx,
+            program=program,
+            arguments=arguments,
+            script=script,
+            launcher=launcher,
+            capture=capture,
+            auth=auth,
+            interactive=interactive,
+            timeout=timeout,
         )
 
     async def run_script(
@@ -211,165 +252,169 @@ class GuestOps:
         timeout: float | None = None,
     ) -> GuestCommandResult:
         """Write a script into the guest and run it with ``interpreter``."""
+        if not script_text.strip():
+            raise InvalidArgumentError("script must not be empty.")
+
         family = guest_os_family(guest_os) or "windows"
+        token = uuid.uuid4().hex[:8]
+        temp = self._settings.guest_temp(family)
+        chosen = interpreter.strip()
+
         if family == "windows":
-            remote = r"C:\Windows\Temp\vmware-mcp-script.cmd"
-            await self._write_text(vmx, remote, script_text.replace("\n", "\r\n"), auth=auth)
+            powershell = not chosen or "powershell" in chosen.lower() or "pwsh" in chosen.lower()
+            if powershell:
+                body_path = _join(temp, f"vmware-mcp-{token}-body.ps1", family)
+                program = chosen or _POWERSHELL
+                arguments = f'-NoProfile -ExecutionPolicy Bypass -File "{body_path}"'
+                body = script_text.replace("\r\n", "\n").replace("\n", "\r\n")
+            else:
+                body_path = _join(temp, f"vmware-mcp-{token}-body.cmd", family)
+                program = chosen
+                arguments = f'/C "{body_path}"'
+                body = script_text.replace("\r\n", "\n").replace("\n", "\r\n")
+        else:
+            body_path = _join(temp, f"vmware-mcp-{token}-body.sh", family)
+            program = chosen or "/bin/sh"
+            arguments = body_path
+            body = script_text
+
+        await self._write_text(vmx, body_path, body, auth=auth)
+        try:
             return await self.run_program(
                 vmx,
-                interpreter or "cmd.exe",
-                f'/C "{remote}"',
+                program,
+                arguments,
                 auth=auth,
                 guest_os=guest_os,
                 timeout=timeout,
             )
-        remote = "/tmp/vmware-mcp-script.sh"
-        await self._write_text(vmx, remote, script_text, auth=auth)
-        await self.run_program(
-            vmx, "/bin/chmod", f"+x {remote}", auth=auth, guest_os=guest_os, timeout=30
-        )
-        return await self.run_program(
-            vmx,
-            interpreter or "/bin/sh",
-            remote,
-            auth=auth,
-            guest_os=guest_os,
-            timeout=timeout,
-        )
+        finally:
+            await self._cleanup(vmx, (body_path,), auth=auth)
+
+    # -- files -------------------------------------------------------------- #
 
     async def copy_host_to_guest(
-        self, vmx: Path, host_path: str, guest_path: str, *, auth: GuestAuth
+        self,
+        vmx: Path,
+        host_path: Path,
+        guest_path: str,
+        *,
+        auth: GuestAuth,
+        guest_os: str | None = None,
+        create_parents: bool = True,
     ) -> dict[str, Any]:
-        source = Path(host_path).expanduser()
-        if not source.is_file():
-            raise InvalidArgumentError(f"Host file does not exist: {source}")
+        target = validate_guest_path(guest_path)
+        if not host_path.is_file():
+            raise InvalidArgumentError(f"Host file does not exist: {host_path}")
+        family = guest_os_family(guest_os) or "windows"
+        if create_parents:
+            parent = _parent(target, family)
+            if parent:
+                await self._runner.run(
+                    "createDirectoryInGuest",
+                    str(vmx),
+                    parent,
+                    auth=auth,
+                    check=False,
+                    timeout=60,
+                )
         await self._runner.run(
             "CopyFileFromHostToGuest",
             str(vmx),
-            str(source),
-            guest_path,
+            str(host_path),
+            target,
             auth=auth,
             timeout=self._settings.guest_timeout,
         )
         return {
             "direction": "host_to_guest",
-            "host_path": str(source),
-            "guest_path": guest_path,
-            "bytes": source.stat().st_size,
+            "host_path": str(host_path),
+            "guest_path": target,
+            "bytes": host_path.stat().st_size,
         }
 
     async def copy_guest_to_host(
-        self, vmx: Path, guest_path: str, host_path: str, *, auth: GuestAuth
+        self, vmx: Path, guest_path: str, host_path: Path, *, auth: GuestAuth
     ) -> dict[str, Any]:
-        destination = Path(host_path).expanduser()
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        source = validate_guest_path(guest_path)
+        await anyio.to_thread.run_sync(lambda: host_path.parent.mkdir(parents=True, exist_ok=True))
         await self._runner.run(
             "CopyFileFromGuestToHost",
             str(vmx),
-            guest_path,
-            str(destination),
+            source,
+            str(host_path),
             auth=auth,
             timeout=self._settings.guest_timeout,
         )
-        size = destination.stat().st_size if destination.is_file() else 0
+        size = host_path.stat().st_size if host_path.is_file() else 0
         return {
             "direction": "guest_to_host",
-            "host_path": str(destination),
-            "guest_path": guest_path,
+            "host_path": str(host_path),
+            "guest_path": source,
             "bytes": size,
         }
 
     async def list_directory(self, vmx: Path, guest_path: str, *, auth: GuestAuth) -> list[str]:
+        target = validate_guest_path(guest_path, field="path")
         result = await self._runner.run(
-            "listDirectoryInGuest", str(vmx), guest_path, auth=auth, timeout=60
+            "listDirectoryInGuest", str(vmx), target, auth=auth, timeout=60
         )
-        return result.lines
+        return [line for line in result.lines if not line.lower().startswith("directory of")]
 
     async def file_exists(self, vmx: Path, guest_path: str, *, auth: GuestAuth) -> bool:
         result = await self._runner.run(
-            "fileExistsInGuest", str(vmx), guest_path, auth=auth, check=False, timeout=30
+            "fileExistsInGuest",
+            str(vmx),
+            validate_guest_path(guest_path),
+            auth=auth,
+            check=False,
+            timeout=30,
         )
-        return result.exit_code == 0
+        return not result.failed
 
-    # -- internals --------------------------------------------------------- #
+    # -- internals ---------------------------------------------------------- #
 
-    async def _run_windows(
+    def _capture_paths(self, family: str) -> _Capture:
+        token = uuid.uuid4().hex[:8]
+        temp = self._settings.guest_temp(family)
+        suffix = "ps1" if family == "windows" else "sh"
+        return _Capture(
+            stdout=_join(temp, f"vmware-mcp-{token}-out.txt", family),
+            stderr=_join(temp, f"vmware-mcp-{token}-err.txt", family),
+            exit_code=_join(temp, f"vmware-mcp-{token}-code.txt", family),
+            script=_join(temp, f"vmware-mcp-{token}-run.{suffix}", family),
+        )
+
+    async def _run_captured(
         self,
         vmx: Path,
+        *,
         program: str,
         arguments: str,
-        *,
+        script: str,
+        launcher: list[str],
+        capture: _Capture,
         auth: GuestAuth,
         interactive: bool,
         timeout: float | None,
     ) -> GuestCommandResult:
-        token = uuid.uuid4().hex[:8]
-        out_remote = rf"C:\Windows\Temp\vmware-mcp-{token}-out.txt"
-        err_remote = rf"C:\Windows\Temp\vmware-mcp-{token}-err.txt"
-        code_remote = rf"C:\Windows\Temp\vmware-mcp-{token}-code.txt"
-        script_remote = rf"C:\Windows\Temp\vmware-mcp-{token}-run.ps1"
-        script = _windows_capture_script(program, arguments, out_remote, err_remote, code_remote)
-        await self._write_text(vmx, script_remote, script, auth=auth)
+        await self._write_text(vmx, capture.script, script, auth=auth)
         guest_args = [str(vmx)]
         if interactive:
             guest_args.append("-interactive")
-        guest_args += [
-            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            script_remote,
-        ]
-        await self._runner.run(
-            "runProgramInGuest",
-            *guest_args,
-            auth=auth,
-            timeout=timeout or self._settings.guest_timeout,
-        )
-        stdout, stdout_trunc = await self._read_guest_text(vmx, out_remote, auth=auth)
-        stderr, stderr_trunc = await self._read_guest_text(vmx, err_remote, auth=auth)
-        code_text, _ = await self._read_guest_text(vmx, code_remote, auth=auth)
-        return GuestCommandResult(
-            program=program,
-            arguments=arguments,
-            exit_code=_parse_exit_code(code_text),
-            stdout=stdout,
-            stderr=stderr,
-            truncated=stdout_trunc or stderr_trunc,
-        )
-
-    async def _run_posix(
-        self,
-        vmx: Path,
-        program: str,
-        arguments: str,
-        *,
-        auth: GuestAuth,
-        interactive: bool,
-        timeout: float | None,
-    ) -> GuestCommandResult:
-        token = uuid.uuid4().hex[:8]
-        out_remote = f"/tmp/vmware-mcp-{token}-out.txt"
-        err_remote = f"/tmp/vmware-mcp-{token}-err.txt"
-        code_remote = f"/tmp/vmware-mcp-{token}-code.txt"
-        script_remote = f"/tmp/vmware-mcp-{token}-run.sh"
-        script = _posix_capture_script(program, arguments, out_remote, err_remote, code_remote)
-        await self._write_text(vmx, script_remote, script, auth=auth)
-        guest_args = [str(vmx)]
-        if interactive:
-            guest_args.append("-interactive")
-        guest_args += ["/bin/sh", script_remote]
-        await self._runner.run(
-            "runProgramInGuest",
-            *guest_args,
-            auth=auth,
-            timeout=timeout or self._settings.guest_timeout,
-        )
-        stdout, stdout_trunc = await self._read_guest_text(vmx, out_remote, auth=auth)
-        stderr, stderr_trunc = await self._read_guest_text(vmx, err_remote, auth=auth)
-        code_text, _ = await self._read_guest_text(vmx, code_remote, auth=auth)
+        guest_args += [*launcher, capture.script]
+        try:
+            await self._runner.run(
+                "runProgramInGuest",
+                *guest_args,
+                auth=auth,
+                timeout=timeout or self._settings.guest_timeout,
+            )
+            stdout, stdout_trunc = await self._read_guest_text(vmx, capture.stdout, auth=auth)
+            stderr, stderr_trunc = await self._read_guest_text(vmx, capture.stderr, auth=auth)
+            code_text, _ = await self._read_guest_text(vmx, capture.exit_code, auth=auth)
+        finally:
+            await self._cleanup(vmx, capture.all_paths, auth=auth)
         return GuestCommandResult(
             program=program,
             arguments=arguments,
@@ -395,18 +440,16 @@ class GuestOps:
             )
             if not host_path.is_file():
                 return "", False
-            data = host_path.read_bytes()
             limit = self._settings.max_output_bytes
-            truncated = len(data) > limit
-            text = data[:limit].decode("utf-8", "replace")
-            return text, truncated
+            data, truncated = await anyio.to_thread.run_sync(_read_capped, host_path, limit)
+            return data.decode("utf-8", "replace"), truncated
 
     async def _write_text(
         self, vmx: Path, guest_path: str, content: str, *, auth: GuestAuth
     ) -> None:
         with tempfile.TemporaryDirectory(prefix="vmware-mcp-") as tmp:
             host_path = Path(tmp) / "upload.txt"
-            host_path.write_text(content, encoding="utf-8")
+            await anyio.to_thread.run_sync(lambda: host_path.write_text(content, encoding="utf-8"))
             await self._runner.run(
                 "CopyFileFromHostToGuest",
                 str(vmx),
@@ -416,6 +459,40 @@ class GuestOps:
                 timeout=60,
             )
 
+    async def _cleanup(self, vmx: Path, guest_paths: tuple[str, ...], *, auth: GuestAuth) -> None:
+        """Best-effort removal of our scratch files; never fails the caller."""
+        for path in guest_paths:
+            with suppress(Exception):
+                await self._runner.run(
+                    "deleteFileInGuest",
+                    str(vmx),
+                    path,
+                    auth=auth,
+                    check=False,
+                    timeout=30,
+                )
+
+
+_POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+
+
+def _read_capped(path: Path, limit: int) -> tuple[bytes, bool]:
+    """Read at most ``limit`` bytes, reporting whether more was available."""
+    chunks: list[bytes] = []
+    total = 0
+    with path.open("rb") as handle:
+        while total <= limit:
+            chunk = handle.read(min(_READ_CHUNK, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        more = bool(handle.read(1))
+    data = b"".join(chunks)
+    if len(data) > limit:
+        return data[:limit], True
+    return data, more
+
 
 def _positive_timeout(timeout: float | None, default: float) -> float:
     limit = default if timeout is None else float(timeout)
@@ -424,15 +501,29 @@ def _positive_timeout(timeout: float | None, default: float) -> float:
     return limit
 
 
+def _join(directory: str, name: str, family: str) -> str:
+    separator = "\\" if family == "windows" else "/"
+    return directory.rstrip("/\\") + separator + name
+
+
+def _parent(path: str, family: str) -> str | None:
+    separator = "\\" if family == "windows" else "/"
+    normalized = path.replace("/", "\\") if family == "windows" else path
+    head, sep, _ = normalized.rpartition(separator)
+    if not sep or not head:
+        return None
+    if family == "windows" and head.endswith(":"):
+        return head + separator
+    return head
+
+
 def _ps_quote(value: str) -> str:
     """Single-quoted PowerShell literal; the only escape is doubling ``'``."""
     return "'" + value.replace("'", "''") + "'"
 
 
-def _windows_capture_script(
-    program: str, arguments: str, out_remote: str, err_remote: str, code_remote: str
-) -> str:
-    """Run ``program`` via ProcessStartInfo so cmd metacharacters are not interpreted."""
+def _windows_capture_script(program: str, arguments: str, capture: _Capture) -> str:
+    """Run ``program`` via ProcessStartInfo so cmd metacharacters are inert."""
     return (
         "$ErrorActionPreference = 'Continue'\n"
         "$psi = New-Object System.Diagnostics.ProcessStartInfo\n"
@@ -444,28 +535,33 @@ def _windows_capture_script(
         "$psi.CreateNoWindow = $true\n"
         "$proc = New-Object System.Diagnostics.Process\n"
         "$proc.StartInfo = $psi\n"
-        "[void]$proc.Start()\n"
-        "$stdout = $proc.StandardOutput.ReadToEnd()\n"
-        "$stderr = $proc.StandardError.ReadToEnd()\n"
-        "$proc.WaitForExit()\n"
-        f"[System.IO.File]::WriteAllText({_ps_quote(out_remote)}, $stdout)\n"
-        f"[System.IO.File]::WriteAllText({_ps_quote(err_remote)}, $stderr)\n"
-        f"[System.IO.File]::WriteAllText({_ps_quote(code_remote)}, [string]$proc.ExitCode)\n"
+        "try {\n"
+        "  [void]$proc.Start()\n"
+        "  $stdout = $proc.StandardOutput.ReadToEnd()\n"
+        "  $stderr = $proc.StandardError.ReadToEnd()\n"
+        "  $proc.WaitForExit()\n"
+        "  $code = $proc.ExitCode\n"
+        "} catch {\n"
+        "  $stdout = ''\n"
+        "  $stderr = $_.Exception.Message\n"
+        "  $code = 9009\n"
+        "}\n"
+        f"[System.IO.File]::WriteAllText({_ps_quote(capture.stdout)}, $stdout)\n"
+        f"[System.IO.File]::WriteAllText({_ps_quote(capture.stderr)}, $stderr)\n"
+        f"[System.IO.File]::WriteAllText({_ps_quote(capture.exit_code)}, [string]$code)\n"
     )
 
 
-def _posix_capture_script(
-    program: str, arguments: str, out_remote: str, err_remote: str, code_remote: str
-) -> str:
-    """Quote program and each argument so the wrapper shell cannot be hijacked."""
+def _posix_capture_script(program: str, arguments: str, capture: _Capture) -> str:
+    """Quote the program and every argument so the wrapper shell stays inert."""
     try:
         tokens = shlex.split(arguments, posix=True) if arguments.strip() else []
     except ValueError as exc:
         raise InvalidArgumentError(f"Could not parse arguments: {exc}") from exc
-    cmd = " ".join([shlex.quote(program), *(shlex.quote(token) for token in tokens)])
+    command = " ".join([shlex.quote(program), *(shlex.quote(token) for token in tokens)])
     return (
-        f"{cmd} > {shlex.quote(out_remote)} 2> {shlex.quote(err_remote)}\n"
-        f"echo $? > {shlex.quote(code_remote)}\n"
+        f"{command} > {shlex.quote(capture.stdout)} 2> {shlex.quote(capture.stderr)}\n"
+        f"echo $? > {shlex.quote(capture.exit_code)}\n"
     )
 
 
@@ -475,3 +571,6 @@ def _parse_exit_code(text: str) -> int | None:
         if stripped.isdigit() or (stripped.startswith("-") and stripped[1:].isdigit()):
             return int(stripped)
     return None
+
+
+__all__ = ["GuestCommandResult", "GuestOps"]

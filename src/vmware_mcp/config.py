@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
@@ -12,6 +13,9 @@ from pathlib import Path
 from .errors import ConfigurationError, PermissionDeniedError
 
 ENV_PREFIX = "VMWARE_"
+
+#: Value that switches a directory allow-list off entirely.
+UNRESTRICTED = "*"
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "y", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "n", "off"})
@@ -30,10 +34,12 @@ class Product(str, Enum):
         aliases = {
             "ws": cls.WORKSTATION,
             "workstation": cls.WORKSTATION,
+            "vmware workstation": cls.WORKSTATION,
             "fusion": cls.FUSION,
             "vmware fusion": cls.FUSION,
             "player": cls.PLAYER,
             "vmware player": cls.PLAYER,
+            "workstation player": cls.PLAYER,
         }
         try:
             return aliases[normalized]
@@ -94,15 +100,6 @@ _MODE_RANK: dict[PermissionMode, int] = {
 }
 
 
-def _parse_bool(value: str, *, name: str) -> bool:
-    normalized = value.strip().lower()
-    if normalized in _TRUE_VALUES:
-        return True
-    if normalized in _FALSE_VALUES:
-        return False
-    raise ConfigurationError(f"{name} must be a boolean value, got {value!r}.")
-
-
 def _parse_int(value: str, *, name: str, minimum: int | None = None) -> int:
     try:
         parsed = int(value.strip())
@@ -136,6 +133,11 @@ def default_vm_directories() -> tuple[Path, ...]:
     return tuple(candidates)
 
 
+def default_host_write_directory() -> Path:
+    """Scratch directory that guest-to-host copies may always write into."""
+    return Path(tempfile.gettempdir()) / "vmware-mcp"
+
+
 def _split_paths(raw: str) -> tuple[Path, ...]:
     parts = [part.strip() for part in raw.split(os.pathsep)]
     return tuple(Path(part).expanduser() for part in parts if part)
@@ -156,15 +158,35 @@ class Settings:
     command_timeout: int = 120
     guest_timeout: int = 300
     boot_timeout: int = 300
+    clone_timeout: int = 1800
     max_output_bytes: int = 100_000
     max_results: int = 500
     default_page_size: int = 100
+    max_concurrency: int = 4
+    max_clone_batch: int = 50
     cache_ttl: int = 5
+    #: Host directories that ``copy_to_guest`` may read from. Empty means anywhere.
+    host_read_dirs: tuple[Path, ...] = ()
+    #: Host directories that guest-to-host copies and screenshots may write into.
+    #: Empty means anywhere; the default is the VM library plus a temp scratch dir.
+    host_write_dirs: tuple[Path, ...] = ()
     log_level: str = "INFO"
 
     @property
     def has_guest_credentials(self) -> bool:
         return bool(self.guest_username)
+
+    def guest_temp(self, family: str | None) -> str:
+        """Directory inside the guest used for capture and script files."""
+        if self.guest_temp_dir:
+            return self.guest_temp_dir.rstrip("/\\")
+        return r"C:\Windows\Temp" if (family or "windows") == "windows" else "/tmp"
+
+    def effective_host_write_dirs(self) -> tuple[Path, ...]:
+        """Where the server may create files on the host."""
+        if self.host_write_dirs:
+            return self.host_write_dirs
+        return (*self.vm_dirs, default_host_write_directory())
 
     def require(self, required: PermissionMode, operation: str) -> None:
         """Raise unless the configured mode permits ``operation``."""
@@ -188,8 +210,14 @@ class Settings:
             "command_timeout_seconds": self.command_timeout,
             "guest_timeout_seconds": self.guest_timeout,
             "boot_timeout_seconds": self.boot_timeout,
+            "clone_timeout_seconds": self.clone_timeout,
+            "max_concurrency": self.max_concurrency,
+            "max_clone_batch": self.max_clone_batch,
             "max_results": self.max_results,
             "default_page_size": self.default_page_size,
+            "host_read_dirs": [str(path) for path in self.host_read_dirs] or "unrestricted",
+            "host_write_dirs": [str(path) for path in self.effective_host_write_dirs()]
+            or "unrestricted",
         }
 
 
@@ -217,6 +245,13 @@ class _EnvReader:
         if value is None:
             return default
         return _parse_int(value, name=ENV_PREFIX + name, minimum=minimum)
+
+    def dirs(self, name: str, *aliases: str) -> tuple[Path, ...]:
+        """Directory list; the literal ``*`` disables the restriction."""
+        value = self.text(name, *aliases)
+        if value is None or value.strip() == UNRESTRICTED:
+            return ()
+        return _split_paths(value)
 
 
 def load_settings(env: Mapping[str, str] | None = None) -> Settings:
@@ -250,19 +285,26 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         command_timeout=reader.number("COMMAND_TIMEOUT", 120, 1),
         guest_timeout=reader.number("GUEST_TIMEOUT", 300, 1),
         boot_timeout=reader.number("BOOT_TIMEOUT", 300, 1),
+        clone_timeout=reader.number("CLONE_TIMEOUT", 1800, 1),
         max_output_bytes=reader.number("MAX_OUTPUT_BYTES", 100_000, 1024),
         max_results=max_results,
         default_page_size=min(reader.number("DEFAULT_PAGE_SIZE", 100, 1), max_results),
+        max_concurrency=reader.number("MAX_CONCURRENCY", 4, 1),
+        max_clone_batch=reader.number("MAX_CLONE_BATCH", 50, 1),
         cache_ttl=reader.number("CACHE_TTL", 5, 0),
+        host_read_dirs=reader.dirs("HOST_READ_DIRS"),
+        host_write_dirs=reader.dirs("HOST_WRITE_DIRS"),
         log_level=(reader.text("LOG_LEVEL") or "INFO").upper(),
     )
 
 
 __all__: Sequence[str] = (
     "ENV_PREFIX",
+    "UNRESTRICTED",
     "PermissionMode",
     "Product",
     "Settings",
+    "default_host_write_directory",
     "default_vm_directories",
     "load_settings",
 )

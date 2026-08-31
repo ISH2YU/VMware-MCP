@@ -5,17 +5,13 @@ from __future__ import annotations
 from typing import Any
 
 from mcp.server import MCPServer
-from mcp.types import ToolAnnotations
 
-from ...config import Settings
-from .._common import ToolContext, mcp_tool, paginate
-
-READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True)
+from .._common import READ_ONLY, ToolContext, mcp_tool, paginate
 
 
 def register(server: MCPServer, context: ToolContext) -> None:
     client = context.client
-    settings: Settings = context.settings
+    settings = context.settings
 
     @mcp_tool(server, annotations=READ_ONLY)
     async def vmware_about() -> dict[str, Any]:
@@ -76,6 +72,10 @@ def register(server: MCPServer, context: ToolContext) -> None:
 
     @mcp_tool(server, annotations=READ_ONLY)
     async def vmware_list_running() -> dict[str, Any]:
-        """List the ``.vmx`` paths of every VM currently powered on."""
+        """List the ``.vmx`` paths of every VM currently powered on.
+
+        Only VMs inside the configured VM directories are reported, even if
+        VMware itself is running others.
+        """
         paths = await client.list_running()
         return {"count": len(paths), "vms": paths}

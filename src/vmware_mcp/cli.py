@@ -11,6 +11,7 @@ from collections.abc import Sequence
 
 import anyio
 
+from . import __version__
 from .config import ENV_PREFIX, Settings, load_settings
 from .errors import VMwareMCPError
 
@@ -61,6 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--check",
         action="store_true",
         help="Find vmrun, scan VM directories, print a short summary and exit.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"vmware-mcp {__version__}",
+        help="Print the version and exit.",
     )
     return parser
 
