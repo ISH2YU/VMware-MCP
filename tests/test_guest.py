@@ -466,6 +466,8 @@ async def test_non_positive_timeouts_are_rejected(client: WorkstationClient, gol
         ("installed", "installed"),
         ("not installed", "notInstalled"),
         ("notInstalled", "notInstalled"),
+        ("something unexpected", "unknown"),
+        ("", "unknown"),
     ],
 )
 async def test_tools_state_parsing(
@@ -473,6 +475,22 @@ async def test_tools_state_parsing(
 ):
     fake.tools_state[golden] = raw
     assert await client.guest.tools_state(Path(golden)) == expected
+
+
+async def test_a_tools_error_is_not_mistaken_for_running(
+    client: WorkstationClient, fake: FakeVmrun, golden: str
+):
+    """vmrun's failure text literally contains the word "running"."""
+    fake.tools_state[golden] = "error"
+    assert await client.guest.tools_state(Path(golden)) == "unknown"
+
+
+async def test_waiting_for_tools_does_not_succeed_on_an_error(
+    client: WorkstationClient, fake: FakeVmrun, golden: str
+):
+    fake.tools_state[golden] = "error"
+    with pytest.raises(GuestOperationError):
+        await client.guest.wait_for_tools(Path(golden), timeout=0.3, poll_seconds=0.05)
 
 
 async def test_missing_ip_is_none_not_an_error(client: WorkstationClient, golden: str):
@@ -485,7 +503,19 @@ async def test_file_exists_probe(client: WorkstationClient, fake: FakeVmrun, gol
     assert not await client.guest.file_exists(Path(golden), r"C:\Temp\b.txt", auth=client.auth())
 
 
-async def test_list_directory(client: WorkstationClient, fake: FakeVmrun, golden: str):
+async def test_a_broken_file_probe_raises_rather_than_claiming_absence(
+    client: WorkstationClient, fake: FakeVmrun, golden: str
+):
+    """Tools being down must not be reported as "the file is not there"."""
+    fake.fail_commands.add("fileExistsInGuest")
+    with pytest.raises(GuestOperationError):
+        await client.guest.file_exists(Path(golden), r"C:\Temp\a.txt", auth=client.auth())
+
+
+async def test_list_directory_drops_the_count_header(
+    client: WorkstationClient, fake: FakeVmrun, golden: str
+):
     fake.guest_files.setdefault(golden, {}).update({r"C:\Temp\a.txt": b"a", r"C:\Temp\b.txt": b"b"})
     entries = await client.guest.list_directory(Path(golden), r"C:\Temp", auth=client.auth())
     assert sorted(entries) == ["a.txt", "b.txt"]
+    assert not any("directory list" in entry.lower() for entry in entries)

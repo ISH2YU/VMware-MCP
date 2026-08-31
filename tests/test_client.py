@@ -226,9 +226,15 @@ async def test_reverting_a_missing_snapshot_reports_vmrun_error(client: Workstat
 
 
 async def test_snapshot_names_are_validated(client: WorkstationClient):
-    for bad in ["", "  ", "a/b"]:
+    for bad in ["", "  ", "a\\b", "../escape"]:
         with pytest.raises(InvalidArgumentError):
             await client.create_snapshot("win11-golden", bad)
+
+
+async def test_a_snapshot_tree_path_is_accepted(client: WorkstationClient, fake: FakeVmrun):
+    """vmrun uses 'Parent/Child' to pick one of several same-named snapshots."""
+    await client.create_snapshot("win11-golden", "Base/Patched")
+    assert fake.methods("snapshot")[0].args[1] == "Base/Patched"
 
 
 async def test_listing_snapshots_of_a_vm_without_any(client: WorkstationClient):
@@ -271,7 +277,62 @@ async def test_linked_clone_renames_the_display_name(
     assert load_vmx(result["path"]).get("displayname") == "win11-test-01"
     call = fake.methods("clone")[0]
     assert call.args[2] == "linked"
-    assert call.args[3] == "golden"
+    # vmrun takes these as named options; a bare positional snapshot is rejected.
+    assert "-snapshot=golden" in call.args
+    assert "-cloneName=win11-test-01" in call.args
+
+
+async def test_a_clone_without_a_snapshot_passes_no_snapshot_option(
+    client: WorkstationClient, fake: FakeVmrun, vm_root: Path
+):
+    await client.clone_vm("win11-golden", "plain", destination_dir=str(vm_root / "plain"))
+    assert not [arg for arg in fake.methods("clone")[0].args if arg.startswith("-snapshot=")]
+
+
+async def test_a_snapshot_name_with_spaces_survives(
+    client: WorkstationClient, fake: FakeVmrun, vm_root: Path
+):
+    await client.clone_vm(
+        "win11-golden",
+        "spaced",
+        destination_dir=str(vm_root / "spaced"),
+        snapshot="clean build",
+    )
+    assert "-snapshot=clean build" in fake.methods("clone")[0].args
+
+
+async def test_cloning_a_running_vm_without_a_snapshot_is_refused(
+    client: WorkstationClient, fake: FakeVmrun, golden: str, vm_root: Path
+):
+    """VMware can only clone a live VM through a snapshot taken while it was off."""
+    fake.running.add(golden)
+    with pytest.raises(InvalidArgumentError, match="powered on"):
+        await client.clone_vm("win11-golden", "live", destination_dir=str(vm_root / "live"))
+
+
+async def test_cloning_a_running_vm_from_a_snapshot_is_allowed(
+    client: WorkstationClient, fake: FakeVmrun, golden: str, vm_root: Path
+):
+    fake.running.add(golden)
+    result = await client.clone_vm(
+        "win11-golden", "live", destination_dir=str(vm_root / "live"), snapshot="golden"
+    )
+    assert result["status"] == "completed"
+
+
+async def test_player_cannot_clone_or_snapshot(vm_root: Path, fake: FakeVmrun):
+    from vmware_mcp.config import PermissionMode, Product, Settings
+
+    settings = Settings(
+        vm_dirs=(vm_root,),
+        product=Product.PLAYER,
+        permission_mode=PermissionMode.DESTRUCTIVE,
+    )
+    player = WorkstationClient(settings, runner=fake)  # type: ignore[arg-type]
+    with pytest.raises(InvalidArgumentError, match="does not support cloning"):
+        await player.clone_vm("win11-golden", "nope")
+    with pytest.raises(InvalidArgumentError, match="does not support snapshots"):
+        await player.create_snapshot("win11-golden", "nope")
 
 
 async def test_clone_defaults_next_to_the_source(client: WorkstationClient, vm_root: Path):

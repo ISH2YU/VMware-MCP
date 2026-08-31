@@ -21,8 +21,6 @@ _ENCODING_LINE = re.compile(r'^\.encoding\s*=\s*"([^"]*)"', re.IGNORECASE)
 _ENTRY = re.compile(r'^([^=]+?)\s*=\s*"(.*)"\s*$')
 _UNQUOTED = re.compile(r"^([^=]+?)\s*=\s*(.*?)\s*$")
 
-BYTES_PER_MIB = 1024 * 1024
-
 
 @dataclass
 class VmxFile:

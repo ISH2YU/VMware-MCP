@@ -199,7 +199,16 @@ class FakeVmrun:
             return "", "", 0
 
         if command == "checkToolsState":
-            return self.tools_state.get(arguments[0], "running") + "\n", "", 0
+            state = self.tools_state.get(arguments[0], "running")
+            if state == "error":
+                # The real error text contains the word "running", which is a trap
+                # for anything that substring-matches the output.
+                return (
+                    "Error: The VMware Tools are not running in the virtual machine\n",
+                    "",
+                    255,
+                )
+            return state + "\n", "", 0
 
         if command == "getGuestIPAddress":
             ip = self.ips.get(arguments[0])
@@ -239,12 +248,15 @@ class FakeVmrun:
         if command == "listDirectoryInGuest":
             vmx, path = arguments[0], arguments[1]
             entries = [name for name in self.guest_files.get(vmx, {}) if name.startswith(path)]
-            return "\n".join(_basename(name) for name in entries) + "\n", "", 0
+            # vmrun prefixes the listing with a count line.
+            lines = [f"Directory list: {len(entries)}", *(_basename(n) for n in entries)]
+            return "\n".join(lines) + "\n", "", 0
 
         if command == "fileExistsInGuest":
             vmx, path = arguments[0], arguments[1]
+            # vmrun answers in prose on stdout and exits zero either way.
             exists = path in self.guest_files.get(vmx, {})
-            return ("", "", 0) if exists else ("", "Error: A file was not found", 1)
+            return ("The file exists.\n" if exists else "The file does not exist.\n", "", 0)
 
         return "", f"Error: unknown command {command}", 1
 

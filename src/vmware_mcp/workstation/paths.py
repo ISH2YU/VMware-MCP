@@ -126,12 +126,24 @@ def validate_vm_name(name: str, *, field: str = "name") -> str:
 
 
 def validate_snapshot_name(name: str, *, field: str = "snapshot") -> str:
-    """Snapshot names are free-form but must not look like a path."""
+    """Snapshot names are free-form, with one concession to vmrun's own syntax.
+
+    ``/`` is allowed because vmrun uses it to address a snapshot inside a tree
+    (``Base/Patched``), which is the only way to name one of several snapshots
+    that share a label. Snapshot names never reach the filesystem here, so this
+    costs nothing; ``\\`` and ``..`` stay rejected because they only ever
+    indicate confusion with a path.
+    """
     stripped = name.strip()
     if not stripped:
         raise InvalidArgumentError(f"{field} must not be empty.")
-    if any(sep in stripped for sep in ("/", "\\")) or ".." in stripped:
-        raise InvalidArgumentError(f"{field} must not contain path separators.")
+    if "\\" in stripped or ".." in stripped:
+        raise InvalidArgumentError(
+            f"{field} must not contain a backslash or '..'. Use '/' to address a "
+            f"snapshot inside a tree, e.g. 'Base/Patched'."
+        )
+    if stripped.startswith("/") or stripped.endswith("/"):
+        raise InvalidArgumentError(f"{field} must not start or end with '/'.")
     if len(stripped) > MAX_NAME_LENGTH:
         raise InvalidArgumentError(f"{field} must be at most {MAX_NAME_LENGTH} characters.")
     return stripped

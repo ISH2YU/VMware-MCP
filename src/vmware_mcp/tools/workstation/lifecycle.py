@@ -171,11 +171,17 @@ def register(server: MCPServer, context: ToolContext) -> None:
         return await client.delete_many(pattern, confirm=confirm, dry_run=dry_run)
 
     @mcp_tool(server, annotations=MUTATING)
-    async def vmware_screenshot(vm: str, destination: str | None = None) -> dict[str, Any]:
+    async def vmware_screenshot(
+        vm: str,
+        destination: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> dict[str, Any]:
         """Capture a PNG screenshot of a running local virtual machine.
 
         Useful when an AI is debugging a GUI installer or a Windows desktop
-        that is not responding to guest commands.
+        that is not responding to guest commands. VMware needs a guest login for
+        this, so configure guest credentials or pass them here.
 
         The destination must be inside ``VMWARE_HOST_WRITE_DIRS``.
 
@@ -184,6 +190,8 @@ def register(server: MCPServer, context: ToolContext) -> None:
         Args:
             vm: Display name, ``.vmx`` path, directory name or BIOS UUID.
             destination: Host path for the PNG. Defaults next to the ``.vmx``.
+            username: Guest username override.
+            password: Guest password override.
         """
         settings.require(PermissionMode.WRITE, "vmware_screenshot")
-        return await client.screenshot(vm, destination)
+        return await client.screenshot(vm, destination, username=username, password=password)

@@ -134,11 +134,18 @@ def test_rejected_vm_names(name):
         validate_vm_name(name)
 
 
-def test_snapshot_names_allow_punctuation_but_not_paths():
+def test_snapshot_names_allow_punctuation_and_tree_paths():
     assert validate_snapshot_name("before install (v2)") == "before install (v2)"
-    for bad in ["", "   ", "a/b", "a\\b", "../x", "x" * (MAX_NAME_LENGTH + 1)]:
-        with pytest.raises(InvalidArgumentError):
-            validate_snapshot_name(bad)
+    # vmrun addresses a snapshot inside a tree with '/'.
+    assert validate_snapshot_name("Base/Patched") == "Base/Patched"
+
+
+@pytest.mark.parametrize(
+    "bad", ["", "   ", "a\\b", "../x", "/leading", "trailing/", "x" * (MAX_NAME_LENGTH + 1)]
+)
+def test_rejected_snapshot_names(bad):
+    with pytest.raises(InvalidArgumentError):
+        validate_snapshot_name(bad)
 
 
 def test_guest_paths_reject_empty_and_null():

@@ -25,7 +25,7 @@ import anyio.to_thread
 from ..config import Settings
 from ..errors import GuestOperationError, InvalidArgumentError
 from .paths import validate_guest_path
-from .vmrun import GuestAuth, VmrunRunner
+from .vmrun import GuestAuth, VmrunRunner, describe_failure
 from .vmx import guest_os_family
 
 logger = logging.getLogger(__name__)
@@ -106,16 +106,26 @@ class GuestOps:
     # -- readiness ---------------------------------------------------------- #
 
     async def tools_state(self, vmx: Path) -> str:
-        """``running`` / ``installed`` / ``notInstalled`` / ``unknown``."""
+        """``running`` / ``installed`` / ``notInstalled`` / ``unknown``.
+
+        A failure must not be substring-matched: vmrun's own error for this
+        command is "The VMware Tools are not running in the virtual machine",
+        which contains the word *running* and would otherwise be read as the
+        exact opposite of what it says.
+        """
         result = await self._runner.run("checkToolsState", str(vmx), check=False, timeout=30)
-        text = (result.stdout or result.stderr).strip().lower()
-        if "running" in text:
-            return "running"
-        if "not installed" in text or "notinstalled" in text:
-            return "notInstalled"
-        if "installed" in text:
-            return "installed"
-        return text or "unknown"
+        if result.failed:
+            return "unknown"
+        text = (result.stdout or result.stderr).strip()
+        if not text:
+            return "unknown"
+        state = text.splitlines()[-1].strip().lower()
+        return {
+            "running": "running",
+            "installed": "installed",
+            "notinstalled": "notInstalled",
+            "not installed": "notInstalled",
+        }.get(state, "unknown")
 
     async def wait_for_tools(
         self, vmx: Path, *, timeout: float | None = None, poll_seconds: float = 2.0
@@ -359,9 +369,19 @@ class GuestOps:
         result = await self._runner.run(
             "listDirectoryInGuest", str(vmx), target, auth=auth, timeout=60
         )
-        return [line for line in result.lines if not line.lower().startswith("directory of")]
+        lines = result.lines
+        # vmrun prefixes the listing with a count line, which is not a file.
+        if lines and lines[0].lower().startswith("directory list"):
+            lines = lines[1:]
+        return lines
 
     async def file_exists(self, vmx: Path, guest_path: str, *, auth: GuestAuth) -> bool:
+        """Whether a path exists in the guest.
+
+        vmrun answers in words on stdout, so the exit status alone cannot tell
+        "the file is missing" apart from "Tools is down" or "wrong password".
+        Those deserve an exception, not a confident ``False``.
+        """
         result = await self._runner.run(
             "fileExistsInGuest",
             str(vmx),
@@ -370,7 +390,14 @@ class GuestOps:
             check=False,
             timeout=30,
         )
-        return not result.failed
+        answer = (result.stdout or result.stderr).strip().lower()
+        if answer.startswith("the file exists"):
+            return True
+        if answer.startswith("the file does not exist"):
+            return False
+        if result.failed:
+            raise GuestOperationError(describe_failure(result))
+        return False
 
     # -- internals ---------------------------------------------------------- #
 

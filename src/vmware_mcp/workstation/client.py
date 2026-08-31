@@ -10,7 +10,7 @@ from typing import Any, Literal
 import anyio
 import anyio.to_thread
 
-from ..config import Settings
+from ..config import Product, Settings
 from ..errors import InvalidArgumentError, VMwareMCPError
 from .discovery import DiscoveredVm, VmInventory, name_matches
 from .guest import GuestAuth, GuestOps
@@ -229,6 +229,7 @@ class WorkstationClient:
         ]
 
     async def create_snapshot(self, identifier: str, name: str) -> dict[str, Any]:
+        self._require_pro_feature("snapshots")
         vm = await self.inventory.resolve_async(identifier)
         snapshot_name = validate_snapshot_name(name, field="name")
         await self.runner.run("snapshot", str(vm.path), snapshot_name)
@@ -294,10 +295,20 @@ class WorkstationClient:
         clone_type: CloneType,
         snapshot: str | None,
     ) -> dict[str, Any]:
+        self._require_pro_feature("cloning")
         clone_name = validate_vm_name(name)
         if clone_type not in ("full", "linked"):
             raise InvalidArgumentError("clone_type must be 'linked' or 'full'.")
         snap = validate_snapshot_name(snapshot) if snapshot else None
+
+        # vmrun can only clone a powered-off VM, unless it is told to clone from
+        # a snapshot that was taken while the VM was off.
+        if snap is None and await self._is_running(source):
+            raise InvalidArgumentError(
+                f"{source.name!r} is powered on. VMware can only clone a running VM "
+                f"through a snapshot: stop it first, or pass snapshot=... naming a "
+                f"snapshot taken while it was powered off."
+            )
 
         if not self.settings.vm_dirs:
             raise InvalidArgumentError(
@@ -322,9 +333,13 @@ class WorkstationClient:
         created_dir = not target_dir.exists()
         await anyio.to_thread.run_sync(lambda: target_dir.mkdir(parents=True, exist_ok=True))
 
-        args = [str(source.path), str(target_vmx), clone_type]
+        # vmrun's signature is:
+        #   clone <source .vmx> <dest .vmx> full|linked [-snapshot=Name] [-cloneName=Name]
+        # The snapshot is a named option, not a positional; passing it bare makes
+        # vmrun reject the call.
+        args = [str(source.path), str(target_vmx), clone_type, f"-cloneName={clone_name}"]
         if snap:
-            args.append(snap)
+            args.append(f"-snapshot={snap}")
         try:
             await self.runner.run("clone", *args, timeout=self.settings.clone_timeout)
         except Exception:
@@ -488,7 +503,14 @@ class WorkstationClient:
         self.inventory.invalidate()
         return {"vm": vm.name, "path": str(vm.path), "status": "completed"}
 
-    async def screenshot(self, identifier: str, destination: str | None = None) -> dict[str, Any]:
+    async def screenshot(
+        self,
+        identifier: str,
+        destination: str | None = None,
+        *,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> dict[str, Any]:
         vm = await self.inventory.resolve_async(identifier)
         raw_target = (
             Path(destination).expanduser()
@@ -497,7 +519,14 @@ class WorkstationClient:
         )
         target = require_host_write(raw_target, self.settings.effective_host_write_dirs())
         await anyio.to_thread.run_sync(lambda: target.parent.mkdir(parents=True, exist_ok=True))
-        await self.runner.run("captureScreen", str(vm.path), str(target))
+        # vmrun documents captureScreen as needing a guest login. Send one when we
+        # have it, but do not start demanding credentials from setups that work.
+        auth = (
+            self.auth(username, password)
+            if username is not None or self.settings.has_guest_credentials
+            else None
+        )
+        await self.runner.run("captureScreen", str(vm.path), str(target), auth=auth)
         return {
             "vm": vm.name,
             "path": str(vm.path),
@@ -641,6 +670,14 @@ class WorkstationClient:
     async def _is_running(self, vm: DiscoveredVm) -> bool:
         running = {normalize_path(path) for path in await self.list_running()}
         return normalize_path(vm.path) in running
+
+    def _require_pro_feature(self, feature: str) -> None:
+        """Player has neither snapshots nor cloning; say so instead of failing obscurely."""
+        if self.settings.product is Product.PLAYER:
+            raise InvalidArgumentError(
+                f"VMware Player does not support {feature}. Workstation Pro or Fusion "
+                f"Pro is required; set VMWARE_PRODUCT if this machine has one."
+            )
 
     def _default_clone_dir(self, source: DiscoveredVm, clone_name: str) -> Path:
         """Sibling of the source VM if that stays inside the library, else first VM dir."""
