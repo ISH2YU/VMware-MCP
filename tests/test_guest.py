@@ -121,6 +121,20 @@ def test_windows_wrapper_records_a_failure_to_launch():
     assert "9009" in script
 
 
+def test_windows_wrapper_drains_both_pipes_before_waiting():
+    """Reading one stream to the end before WaitForExit deadlocks on a chatty child."""
+    script = _windows_capture_script("setup.exe", "/verbose", _Capture())
+    assert "ReadToEndAsync()" in script
+    assert ".StandardOutput.ReadToEnd()" not in script
+    assert ".StandardError.ReadToEnd()" not in script
+    start = script.index("$proc.Start()")
+    out_read = script.index("$proc.StandardOutput.ReadToEndAsync()")
+    err_read = script.index("$proc.StandardError.ReadToEndAsync()")
+    wait = script.index("$proc.WaitForExit()")
+    assert start < out_read < wait, "stdout must be draining before the wait"
+    assert start < err_read < wait, "stderr must be draining before the wait"
+
+
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #

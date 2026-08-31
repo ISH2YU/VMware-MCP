@@ -523,7 +523,12 @@ def _ps_quote(value: str) -> str:
 
 
 def _windows_capture_script(program: str, arguments: str, capture: _Capture) -> str:
-    """Run ``program`` via ProcessStartInfo so cmd metacharacters are inert."""
+    """Run ``program`` via ProcessStartInfo so cmd metacharacters are inert.
+
+    Both pipes are drained asynchronously *before* waiting for the process.
+    Reading one stream to the end first would deadlock as soon as the child
+    filled the other pipe's buffer, which a chatty installer does easily.
+    """
     return (
         "$ErrorActionPreference = 'Continue'\n"
         "$psi = New-Object System.Diagnostics.ProcessStartInfo\n"
@@ -537,9 +542,11 @@ def _windows_capture_script(program: str, arguments: str, capture: _Capture) -> 
         "$proc.StartInfo = $psi\n"
         "try {\n"
         "  [void]$proc.Start()\n"
-        "  $stdout = $proc.StandardOutput.ReadToEnd()\n"
-        "  $stderr = $proc.StandardError.ReadToEnd()\n"
+        "  $outTask = $proc.StandardOutput.ReadToEndAsync()\n"
+        "  $errTask = $proc.StandardError.ReadToEndAsync()\n"
         "  $proc.WaitForExit()\n"
+        "  $stdout = $outTask.Result\n"
+        "  $stderr = $errTask.Result\n"
         "  $code = $proc.ExitCode\n"
         "} catch {\n"
         "  $stdout = ''\n"
