@@ -168,8 +168,10 @@ class Settings:
     #: Host directories that ``copy_to_guest`` may read from. Empty means anywhere.
     host_read_dirs: tuple[Path, ...] = ()
     #: Host directories that guest-to-host copies and screenshots may write into.
-    #: Empty means anywhere; the default is the VM library plus a temp scratch dir.
-    host_write_dirs: tuple[Path, ...] = ()
+    #: ``None`` means "not configured", which falls back to the VM library plus a
+    #: temp scratch dir. An empty tuple means the operator explicitly asked for
+    #: no restriction at all.
+    host_write_dirs: tuple[Path, ...] | None = None
     log_level: str = "INFO"
 
     @property
@@ -183,10 +185,10 @@ class Settings:
         return r"C:\Windows\Temp" if (family or "windows") == "windows" else "/tmp"
 
     def effective_host_write_dirs(self) -> tuple[Path, ...]:
-        """Where the server may create files on the host."""
-        if self.host_write_dirs:
-            return self.host_write_dirs
-        return (*self.vm_dirs, default_host_write_directory())
+        """Where the server may create files on the host. Empty means anywhere."""
+        if self.host_write_dirs is None:
+            return (*self.vm_dirs, default_host_write_directory())
+        return self.host_write_dirs
 
     def require(self, required: PermissionMode, operation: str) -> None:
         """Raise unless the configured mode permits ``operation``."""
@@ -220,6 +222,10 @@ class Settings:
             or "unrestricted",
         }
 
+    def __post_init__(self) -> None:
+        if self.default_page_size > self.max_results:
+            object.__setattr__(self, "default_page_size", self.max_results)
+
 
 class _EnvReader:
     def __init__(self, source: Mapping[str, str]) -> None:
@@ -246,12 +252,20 @@ class _EnvReader:
             return default
         return _parse_int(value, name=ENV_PREFIX + name, minimum=minimum)
 
-    def dirs(self, name: str, *aliases: str) -> tuple[Path, ...]:
-        """Directory list; the literal ``*`` disables the restriction."""
+    def dirs(self, name: str, *aliases: str) -> tuple[Path, ...] | None:
+        """Directory list. ``None`` when unset; ``()`` when the literal ``*`` was given."""
         value = self.text(name, *aliases)
-        if value is None or value.strip() == UNRESTRICTED:
+        if value is None:
+            return None
+        if value.strip() == UNRESTRICTED:
             return ()
-        return _split_paths(value)
+        paths = _split_paths(value)
+        if not paths:
+            raise ConfigurationError(
+                f"{ENV_PREFIX}{name} is set to {value!r}, which contains no usable paths. "
+                f"Use {UNRESTRICTED!r} to remove the restriction entirely."
+            )
+        return paths
 
 
 def load_settings(env: Mapping[str, str] | None = None) -> Settings:
@@ -303,7 +317,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         max_concurrency=reader.number("MAX_CONCURRENCY", 4, 1),
         max_clone_batch=reader.number("MAX_CLONE_BATCH", 50, 1),
         cache_ttl=reader.number("CACHE_TTL", 5, 0),
-        host_read_dirs=reader.dirs("HOST_READ_DIRS"),
+        host_read_dirs=reader.dirs("HOST_READ_DIRS") or (),
         host_write_dirs=reader.dirs("HOST_WRITE_DIRS"),
         log_level=(reader.text("LOG_LEVEL") or "INFO").upper(),
     )

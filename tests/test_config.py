@@ -99,7 +99,7 @@ def test_host_write_can_be_narrowed(tmp_path: Path):
     assert settings.effective_host_write_dirs() == (tmp_path / "out",)
 
 
-def test_a_star_disables_the_allow_list(tmp_path: Path):
+def test_a_star_really_disables_the_write_allow_list(tmp_path: Path):
     settings = load_settings(
         {
             "VMWARE_VM_DIRS": str(tmp_path),
@@ -108,8 +108,22 @@ def test_a_star_disables_the_allow_list(tmp_path: Path):
         }
     )
     assert settings.host_read_dirs == ()
-    assert settings.host_write_dirs == ()
-    assert settings.effective_host_write_dirs() == (tmp_path, default_host_write_directory())
+    assert settings.effective_host_write_dirs() == (), "'*' must mean unrestricted"
+
+
+def test_an_unset_write_list_is_not_the_same_as_a_star(tmp_path: Path):
+    settings = load_settings({"VMWARE_VM_DIRS": str(tmp_path)})
+    assert settings.effective_host_write_dirs() != ()
+
+
+def test_a_write_list_with_no_usable_paths_is_rejected(tmp_path: Path):
+    with pytest.raises(ConfigurationError, match="no usable paths"):
+        load_settings({"VMWARE_VM_DIRS": str(tmp_path), "VMWARE_HOST_WRITE_DIRS": os.pathsep})
+
+
+def test_page_size_is_clamped_even_when_set_directly():
+    settings = Settings(max_results=5, default_page_size=100)
+    assert settings.default_page_size == 5
 
 
 def test_default_scratch_directory_is_under_temp():

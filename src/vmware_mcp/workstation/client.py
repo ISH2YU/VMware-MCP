@@ -127,7 +127,12 @@ class WorkstationClient:
         else:
             detail["tools_state"] = "unknown"
             detail["ip_address"] = None
-        detail["snapshots"] = await self.list_snapshots(str(vm.path))
+        try:
+            detail["snapshots"] = await self.list_snapshots(str(vm.path))
+        except VMwareMCPError as exc:
+            # Report the whole VM rather than failing, but never imply "none".
+            detail["snapshots"] = None
+            detail["snapshots_error"] = str(exc)
         return detail
 
     def resolve(self, identifier: str) -> DiscoveredVm:
@@ -210,10 +215,13 @@ class WorkstationClient:
     # -- snapshots --------------------------------------------------------- #
 
     async def list_snapshots(self, identifier: str) -> list[dict[str, Any]]:
+        """Snapshot names for one VM.
+
+        A failure is raised rather than reported as "no snapshots": those two
+        answers mean very different things to whoever is about to revert.
+        """
         vm = await self.inventory.resolve_async(identifier)
-        result = await self.runner.run("listSnapshots", str(vm.path), check=False, timeout=60)
-        if result.failed:
-            return []
+        result = await self.runner.run("listSnapshots", str(vm.path), timeout=60)
         return [
             {"name": line}
             for line in result.lines

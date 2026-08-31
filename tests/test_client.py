@@ -235,6 +235,22 @@ async def test_listing_snapshots_of_a_vm_without_any(client: WorkstationClient):
     assert await client.list_snapshots("ubuntu-dev") == []
 
 
+async def test_a_snapshot_listing_failure_is_not_reported_as_none(
+    client: WorkstationClient, fake: FakeVmrun
+):
+    """Cannot-tell and there-are-none must not look the same before a revert."""
+    fake.fail_commands.add("listSnapshots")
+    with pytest.raises(VmrunError):
+        await client.list_snapshots("win11-golden")
+
+
+async def test_get_vm_flags_an_unreadable_snapshot_list(client: WorkstationClient, fake: FakeVmrun):
+    fake.fail_commands.add("listSnapshots")
+    detail = await client.get_vm("win11-golden")
+    assert detail["snapshots"] is None
+    assert "simulated failure" in detail["snapshots_error"]
+
+
 # --------------------------------------------------------------------------- #
 # Cloning
 # --------------------------------------------------------------------------- #
